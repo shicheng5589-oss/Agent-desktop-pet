@@ -1,4 +1,4 @@
-/* Codex 桌宠前端：Live2D 形象 + 状态表情 + 进度卡片 */
+/* Agent 桌宠前端：Live2D 形象 + 状态表情 + 进度卡片 */
 
 const STATE_STYLE = {
   idle: { label: "空闲", color: "#7f8c9b", expr: null, motion: "Idle" },
@@ -100,7 +100,9 @@ const ui = {
   cardTokens: el("card-tokens"),
   cardSource: el("card-source"),
   cardActivity: el("card-activity"),
+  cardActivityText: el("card-activity-text"),
   cardSay: el("card-say"),
+  cardUsage: el("card-usage"),
 };
 
 const state = {
@@ -795,8 +797,9 @@ function applyState(payload) {
   ui.cardTools.textContent = payload.tools == null ? "—" : String(payload.tools);
   ui.cardTokens.textContent = payload.tokens || "—";
   ui.cardSource.textContent = payload.source || "—";
-  ui.cardActivity.textContent = payload.activity || "等待 Codex 开始工作…";
+  ui.cardActivityText.textContent = payload.activity || "等待 " + (payload.source || "Agent") + " 开始工作…";
   ui.cardSay.textContent = payload.say || "";
+  ui.cardUsage.textContent = payload.usage || "";   // 今日新增 / 本会话累积（设置里可切、可关）
 
   state.elapsed = payload.elapsed || 0;
 
@@ -884,8 +887,115 @@ function toast(text) {
 function wireInteractions() {
   // 透明窗口是分层的，网页收不到鼠标事件；点击/拖动由宿主程序读取鼠标状态后发消息过来，
   // 所以这里只保留"被戳到了怎么反应"。
+  //
+  // 顺带把右键默认行为整页拦掉（捕获阶段，先于任何元素）：WebView2 已经关掉了自带
+  // 右键菜单，不拦的话没被消费的 WM_CONTEXTMENU 会冒泡给宿主窗口，把窗口自己的
+  // 系统菜单（还原/移动/大小/关闭）勾出来。
+  window.addEventListener("contextmenu", (ev) => ev.preventDefault(), true);
+  initProbe();
+}
+
+/* —— 像素级命中探测 ——
+
+   窗口的"点击穿透"是色键（洋红）做的：网页透明像素 = 洋红 = 鼠标点直接穿到桌面。
+   所以"点在不在角色身上"也只能按**像素**判断。宿主一直在等网页发 {t:"over"}，
+   而网页以前从来没发过，于是只能退回"角色包围盒"判断 —— 包围盒里的透明缝隙
+   （发丝之间、手臂和身体之间、两条腿之间）就变成"又穿过去了、又当成点中了角色"：
+   右键同时弹两个菜单，拖动顺带点到下面的窗口，都是这么来的。
+
+   采样时机是关键：画布没开 preserveDrawingBuffer，只有**这一帧渲染刚结束**时读到的
+   才是有效像素（实测：挂在 PIXI.Ticker.shared 默认优先级上永远读到 0，因为那一刻
+   渲染还没发生）。所以这里包住 renderer.render，在它返回之后立刻读。
+
+   开销控制：一次只读 1 个像素、~20Hz、而且**光标不在窗口里就完全不读** ——
+   早期版本每 120ms 读一次整块画布，把 GPU 流水线读停顿了，这次不能再犯。 */
+const probe = {
+  canvas: null,
+  ctx: null,
+  usable: null,    // null=还没测过 / true=像素读数可信 / false=不可用（宿主退回包围盒判断）
+  over: null,      // 上一次报给宿主的值
+  sampled: false,  // 真采到过一次样才允许上报，避免链路没起来时把点击全禁掉
+  lastAt: 0,
+  lastPt: null,    // 上一次采样的画布坐标（用来判断光标动没动）
+};
+
+function initProbe() {
+  probe.canvas = document.createElement("canvas");
+  probe.canvas.width = 1;
+  probe.canvas.height = 1;
+  probe.ctx = probe.canvas.getContext("2d", { willReadFrequently: true });
+  const renderer = app && app.renderer;
+  if (!renderer || typeof renderer.render !== "function") return;
+  const original = renderer.render.bind(renderer);
+  renderer.render = (...args) => {
+    original(...args);
+    sampleProbe();
+  };
+}
+
+/** 光标位置折算成画布像素坐标（画布带 resolution/autoDensity，按比例换算）。 */
+function probePoint() {
   const canvas = canvasElement();
-  canvas.addEventListener("contextmenu", (ev) => ev.preventDefault());
+  const cur = state.cursor;
+  if (!canvas || !cur || !cur.inside || typeof cur.x !== "number") return null;
+  const rect = canvas.getBoundingClientRect();
+  if (!rect.width || !rect.height) return null;
+  const x = Math.floor((cur.x - rect.left) * (canvas.width / rect.width));
+  const y = Math.floor((cur.y - rect.top) * (canvas.height / rect.height));
+  if (x < 0 || y < 0 || x >= canvas.width || y >= canvas.height) return null;
+  return { x, y };
+}
+
+function sampleProbe() {
+  const pt = probePoint();
+  const sameSpot = Boolean(pt && probe.lastPt && pt.x === probe.lastPt.x && pt.y === probe.lastPt.y);
+  const now = performance.now();
+  // 光标一动就跟帧采（把刚移开就按下的滞后压到 1 帧内）；
+  // 光标不动时只是隔一会儿复核一下（模型自己会动），没必要每帧去读 GPU。
+  if (now - probe.lastAt < (sameSpot ? 500 : 16)) return;
+  probe.lastAt = now;
+  probe.lastPt = pt;
+  if (!pt) {
+    reportProbe(false, 0);                  // 光标不在窗口里，那一定不是"点在角色上"
+    return;
+  }
+  try {
+    const ctx = probe.ctx;
+    ctx.clearRect(0, 0, 1, 1);
+    ctx.drawImage(canvasElement(), pt.x, pt.y, 1, 1, 0, 0, 1, 1);
+    const alpha = ctx.getImageData(0, 0, 1, 1).data[3];
+    probe.sampled = true;
+    if (probe.usable !== true) {
+      probe.usable = true;
+      const canvas = canvasElement();
+      const box = canvas ? canvas.getBoundingClientRect() : null;
+      // 画布尺寸/CSS 尺寸/dpr 一起带上：宿主据此就能验证"采样点 = 光标点"
+      bridge.send({
+        t: "over-probe",
+        value: true,
+        canvas: canvas ? [canvas.width, canvas.height] : null,
+        css: box ? [Math.round(box.width), Math.round(box.height)] : null,
+        dpr: window.devicePixelRatio || 1,
+      });
+    }
+    // alpha>8 = 这一格真的画了东西 = 屏幕上不是洋红 = 点下去归桌宠
+    reportProbe(alpha > 8, alpha);
+  } catch (err) {
+    if (probe.usable !== false) {
+      probe.usable = false;
+      bridge.send({ t: "over-probe", value: false });
+    }
+  }
+}
+
+/** 只在结论变化时上报：宿主 on_character() 用的就是这个值。
+    x/y/alpha 只是给日志排查用的，宿主判断只看 value。 */
+function reportProbe(over, alpha) {
+  const value = Boolean(over);
+  if (!probe.sampled || value === probe.over) return;
+  probe.over = value;
+  const pt = probe.lastPt;
+  bridge.send({ t: "over", value, x: pt ? pt.x : null, y: pt ? pt.y : null, alpha: alpha });
 }
 
 function reaction(kind) {
@@ -990,7 +1100,8 @@ function clearCard() {
   ui.cardTools.textContent = "—";
   ui.cardTokens.textContent = "—";
   ui.cardSource.textContent = "—";
-  ui.cardActivity.textContent = "任务信息已清空";
+  ui.cardActivityText.textContent = "任务信息已清空";
+  ui.cardUsage.textContent = "";
   ui.cardSay.textContent = "";
   toast("进度卡片已清空");
 }

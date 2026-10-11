@@ -1,4 +1,4 @@
-/* 任务进度卡片（独立窗口）：显示 Codex 当前在做什么 */
+/* 任务进度卡片（独立窗口）：显示当前 Agent 在做什么 */
 
 const $ = (id) => document.getElementById(id);
 
@@ -49,7 +49,7 @@ function render(payload) {
   $("tools").textContent = current.tools == null ? "—" : String(current.tools);
   $("tokens").textContent = current.tokens || "—";
   $("source").textContent = current.source || "—";
-  $("activity").textContent = current.activity || "等待 Codex 开始工作…";
+  $("activity").textContent = current.activity || "等待 " + (current.source || "Agent") + " 开始工作…";
   $("say").textContent = current.say || "";
 }
 

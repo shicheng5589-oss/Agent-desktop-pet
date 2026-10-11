@@ -62,11 +62,14 @@ def clean_bottom_actions(mode: str, value) -> dict:
 
 
 DEFAULTS = {
+    "agent": "codex",        # 接入的 Agent（见 agent_state.py 的注册表）：卡片/表情跟着它走
     "scale": 1.0,
     "opacity": 1.0,
     "alwaysOnTop": True,
     "followDesktop": True,
     "showChip": True,
+    "cardOpen": False,       # 进度卡片上次是开着还是收起的：启动时按这个状态还原
+    "usageMode": "today",    # 卡片底部用量显示：today=今日新增（多 agent 合计）/ session=本会话累积 / off=不显示
     "showPanelOnChange": True,
     "gazeRange": 320.0,      # 视线跟随范围（像素，0 = 不跟随）
     "autoExpression": True,   # 自动表情切换（关闭后只显示状态对应表情）
@@ -145,6 +148,8 @@ def save(data: dict) -> dict:
                 clean[key] = clean_bottom_actions(clean.get("bottomButtonsMode", "assistant"), value)
             elif key in DEFAULTS:
                 clean[key] = value
+    clean["agent"] = str(clean.get("agent") or "codex").strip()[:24] or "codex"
+    clean["usageMode"] = clean.get("usageMode") if clean.get("usageMode") in ("today", "session", "off") else "today"
     clean["scale"] = max(0.05, min(4.0, float(clean["scale"])))
     clean["opacity"] = max(0.35, min(1.0, float(clean["opacity"])))
     clean["gazeRange"] = max(0.0, min(2000.0, float(clean["gazeRange"])))
@@ -166,6 +171,7 @@ def save(data: dict) -> dict:
     clean["alwaysOnTop"] = bool(clean["alwaysOnTop"])
     clean["followDesktop"] = bool(clean["followDesktop"])
     clean["showChip"] = bool(clean["showChip"])
+    clean["cardOpen"] = bool(clean.get("cardOpen", False))
     clean["showPanelOnChange"] = bool(clean["showPanelOnChange"])
     with open(SETTINGS_FILE, "w", encoding="utf-8") as fh:
         json.dump(clean, fh, ensure_ascii=False, indent=2)

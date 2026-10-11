@@ -122,6 +122,27 @@ canvas {
   font-size: calc(var(--card-scale) * 12px);
 }
 
+/* 底部一行：左边“在干什么”，右边用量小字（今日新增 / 本会话累积） */
+.card-foot {
+  display: flex;
+  align-items: center;
+  gap: calc(var(--card-scale) * 8px);
+}
+
+.card-foot .card-activity {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.card-usage {
+  flex: 0 0 auto;
+  margin-top: calc(var(--card-scale) * 8px);
+  color: var(--muted);
+  font-size: calc(var(--card-scale) * 11px);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
 .card-activity {
   margin-top: calc(var(--card-scale) * 8px);
   padding: calc(var(--card-scale) * 7px) calc(var(--card-scale) * 9px);
@@ -148,6 +169,7 @@ canvas {
 
 .card.compact .card-row,
 .card.compact .card-activity,
+.card.compact .card-usage,
 .card.compact .card-say {
   display: none;
 }
@@ -378,4 +400,29 @@ canvas {
   box-shadow: 0 8px 20px rgba(0, 0, 0, 0.4);
   font-size: 12px;
   white-space: nowrap;
+}
+
+/* 用量与“整理结果/等待…”同一行，放在框内；token 完整显示。 */
+.card-activity {
+  display: flex;
+  align-items: baseline;
+  gap: calc(var(--card-scale) * 8px);
+}
+
+.card-activity .card-activity-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.card-activity .card-usage {
+  flex: 0 0 auto;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  color: var(--muted);
+  font-size: calc(var(--card-scale) * 11px);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  text-align: right;
 }

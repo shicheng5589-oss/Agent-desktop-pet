@@ -1,4 +1,4 @@
-"""Codex 桌宠 —— 宿主程序。
+"""Agent 桌宠 —— 宿主程序。
 
 一个贴在桌面上的透明小窗，里面跑 Live2D 形象：
 
@@ -19,6 +19,7 @@ import html
 import json
 import math
 import os
+import queue
 import socketserver
 import sys
 import threading
@@ -30,8 +31,26 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 VENDOR = os.path.join(HERE, "vendor")
 WEB = os.path.join(HERE, "web")
 POSITION_FILE = os.path.join(HERE, "pet_position.json")
+SETTINGS_WINDOW_FILE = os.path.join(HERE, "settings_window.json")   # 设置窗口的大小/位置
 PID_FILE = os.path.join(HERE, "pet.pid")
 STOP_FILE = os.path.join(HERE, "stop.request")
+
+# 「切到 Agent 窗口」用的匹配规则：先认进程名（原生 exe 能直接找到），
+# 再认标题关键词（node 系的 CLI 跑在终端里，窗口属于终端进程，只能靠标题/进程树认）。
+AGENT_WINDOW_RULES = {
+    "claude": {"procs": ("claude",), "titles": ("claude",)},
+    "gemini": {"procs": (), "titles": ("gemini",)},
+    "openclaw": {"procs": (), "titles": ("openclaw",)},
+    "hermes": {"procs": ("hermes",), "titles": ("hermes",)},
+    # 桌面版：进程名能直接对上（Kimi Code / Xiaomi MiMo 这类名字带空格也认，匹配时统一小写去 .exe）
+    "dsh": {"procs": ("DeepSeek Harness", "dsh-desktop", "dsh"), "titles": ("deepseek harness", "deepseek")},
+    "zcode": {"procs": ("ZCode",), "titles": ("zcode",)},
+    "workbuddy": {"procs": ("WorkBuddy",), "titles": ("workbuddy",)},
+    "opencode": {"procs": ("opencode-cli", "opencode", "opencodedesktop"), "titles": ("opencode",)},
+    "kimi": {"procs": ("Kimi Code", "kimi-code", "kimi"), "titles": ("kimi",)},
+    "mimo": {"procs": ("Xiaomi MiMo", "mimo"), "titles": ("mimo", "小米")},
+    "qwen": {"procs": ("qwen",), "titles": ("qwen", "千问")},
+}
 
 sys.path.insert(0, VENDOR)
 sys.path.insert(0, HERE)
@@ -40,7 +59,7 @@ WINDOW_W = 400     # 桌宠窗口：固定尺寸，下方放角色、上方放�
 WINDOW_H = 620
 PANEL_W = 420
 PANEL_H = 620
-ICON_SIZE = 48  # 桌面图标大约这么大，"最小"就以它为参照
+ICON_SIZE = 48  # 桌面图标大约这么大：只当缩放下限的兜底参照（现在下限固定 30%）
 CHAR_BASE_H = 380  # 角色本身的基准高度（不含上方留给进度卡片的空间）
 CARD_W = 380   # 进度卡片（CSS 像素）
 CARD_H = 250
@@ -51,6 +70,7 @@ CARD_GAP = 4           # 卡片底部与"发梢/头顶"之间的空隙（CSS 像
 CARD_HEAD_TOP_RATIO = 0.18   # 卡片底边往下贴到模型高度的这个比例（压住头顶发丝，但不挡脸）
 CARD_COMPACT_BELOW = 0.6   # 桌宠缩放小于这个值就用紧凑卡片
 SCALE_MAX_WISH = 1.6       # 放大上限至少给到这里（以前按"不超过半屏"算，屏幕不高时只能到 120%~140%）
+SCALE_MIN = 0.30           # 缩小下限（2026-10-11 抬上来的：以前按"桌面图标大小"约 12%，太小没法用）
 
 TOOL_BUTTONS = ("undo", "pencil", "eraser")
 TOOL_EVENTS = ("single", "right")   # 三个图标：单击触发功能、右键出对应菜单
@@ -59,8 +79,18 @@ TOOL_EVENTS = ("single", "right")   # 三个图标：单击触发功能、右键
 # 以前就是这么分的，结果点最左边的撤回会落进中间那一格，提示"铅笔：未配置功能"。
 TOOL_MARK_X = (("undo", 0.352), ("pencil", 0.457), ("eraser", 0.564))
 TOOL_MARK_Y = 0.775      # 图标中心的纵向位置（相对角色包围盒高度）
-TOOL_MARK_HALF_X = 0.085  # 横向：离最近的那个图标中心多近算点上了
-TOOL_MARK_HALF_Y = 0.075  # 纵向：同上
+# 横向半宽：图标本体大约 ±0.037，这里给到 ±0.046（图标本体 + 一点点容错）。
+# 相邻图标中心间距约 0.105，所以两个按钮的命中区中间会留出 ~0.013 的空隙 ——
+# 点在图标之间的空白不再算按钮，这就是 "横向防误触" 的关键（旧值 0.085 时
+# 两块命中区大面积重叠，整条带子都算"最近的那个按钮"）。
+# 注意：这里全是"相对角色包围盒"的比例，所以放大 / 缩小桌宠时命中区会跟着等比缩放，
+# 不会因为桌宠变小或变大而失准。
+TOOL_MARK_HALF_X = 0.046
+# 纵向半高（相对角色包围盒高度），上下分开：误触几乎都发生在图标**上方**那一截空白，
+# 所以上方收得紧、下方留一点容错。旧值是上下各 0.075（命中带总高 15%），比图标本身
+# 高出快一倍 —— 点在图标上方一截空白也会被算成按到按钮，就是这么来的。
+TOOL_MARK_HALF_Y_UP = 0.032
+TOOL_MARK_HALF_Y_DOWN = 0.045
 TOOL_LABELS = {
     "undo": "↩️ 撤回",
     "pencil": "📝 铅笔",
@@ -78,7 +108,7 @@ TOOL_ACTION_LABELS = {
     "hide-pet": "隐藏到系统托盘",
     "mute-animations": "暂时静音动画",
     "codex-new-session": "新建 Codex 会话",
-    "codex-focus": "切到 Codex / 定位输入框",
+    "codex-focus": "切到 Agent 窗口",
     "codex-rename-task": "重命名当前任务（复制新名称）",
     "codex-add-note": "添加备注",
     "codex-interrupt": "打断当前任务",
@@ -90,11 +120,33 @@ TOOL_ACTION_LABELS = {
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
+GWL_STYLE = -16
+GWL_WNDPROC = -4
 GWL_EXSTYLE = -20
+WS_SYSMENU = 0x00080000      # 有它，DefWindowProc 才会在右键时弹出窗口系统菜单
+WM_CONTEXTMENU = 0x007B      # 右键消息：网页没消费掉就会冒泡到窗口默认处理
+WM_NCRBUTTONUP = 0x00A5      # 非客户区右键：系统菜单的另一条来路
+WM_PET_CLOSE_MENU = 0x8001   # 自定义：让桌宠在消息循环里关掉右键菜单（鼠标钩子里不能直接关）
 WS_EX_LAYERED = 0x00080000
 WS_EX_TRANSPARENT = 0x00000020
 WS_EX_TOOLWINDOW = 0x00000080
 WS_EX_NOACTIVATE = 0x08000000
+
+GA_ROOT = 2                      # GetAncestor：取顶层窗口
+
+# Windows 任务栏/开始菜单等 Shell 覆盖层。它们永远高于桌宠；输入必须原样交给它们，
+# 不能因为光标坐标仍落在桌宠矩形里就触发摸头/拖动/缩放。
+SHELL_OVERLAY_CLASSES = {
+    "Shell_TrayWnd",
+    "Shell_SecondaryTrayWnd",
+    "MSTaskListWClass",
+    "MSTaskSwWClass",
+    "TrayNotifyWnd",
+    "TaskListThumbnailWnd",
+    "XamlExplorerHostIslandWindow",
+    "Windows.UI.Core.CoreWindow",
+    "PopupHost",
+}
 
 SWP_NOSIZE = 0x0001
 SWP_NOMOVE = 0x0002
@@ -125,35 +177,92 @@ user32.GetDpiForWindow.argtypes = [ctypes.c_void_p]
 user32.GetDpiForWindow.restype = ctypes.c_uint
 user32.GetCursorPos.argtypes = [ctypes.POINTER(wt.POINT)]
 user32.GetForegroundWindow.restype = ctypes.c_void_p
+user32.GetClassNameW.argtypes = [wt.HWND, ctypes.c_wchar_p, ctypes.c_int]
+user32.WindowFromPoint.argtypes = [wt.POINT]
+user32.WindowFromPoint.restype = wt.HWND
+user32.GetAncestor.argtypes = [wt.HWND, ctypes.c_uint]
+user32.GetWindowThreadProcessId.argtypes = [wt.HWND, ctypes.POINTER(ctypes.c_ulong)]
+user32.GetWindowRect.argtypes = [wt.HWND, ctypes.POINTER(wt.RECT)]
+user32.GetAncestor.restype = wt.HWND
+user32.SetCapture.argtypes = [wt.HWND]
+user32.SetCapture.restype = wt.HWND
+user32.ReleaseCapture.argtypes = []
+user32.ReleaseCapture.restype = wt.BOOL
+user32.UnhookWindowsHookEx.argtypes = [ctypes.c_void_p]
+user32.UnhookWindowsHookEx.restype = wt.BOOL
 
-log_lock = threading.Lock()
+log_lock = threading.Lock()      # 保留给外部（现在写盘由专门的线程串行做）
 log_path = os.path.join(HERE, "pet.log")
 LOG_MAX_BYTES = 512 * 1024     # 超过 512KB 就只保留最近 300 行
 _log_size = 0
+_log_queue: "queue.Queue" = queue.Queue()
+_log_writer_started = False
 verbose_log = False            # 是否记录鼠标事件（排查用；默认关，设置里可开）
 
 
-def log(message: str, force: bool = False) -> None:
+def _write_log_line(line: str) -> None:
     global _log_size
+    try:
+        with open(log_path, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+        _log_size += len(line.encode("utf-8")) + 1
+        if _log_size > LOG_MAX_BYTES:
+            with open(log_path, encoding="utf-8") as fh:
+                tail = fh.readlines()[-300:]
+            with open(log_path, "w", encoding="utf-8") as fh:
+                fh.writelines(tail)
+            _log_size = sum(len(t.encode("utf-8")) for t in tail)
+    except OSError:
+        pass
+
+
+def _log_writer() -> None:
+    while True:
+        line = _log_queue.get()
+        if line is None:
+            return
+        _write_log_line(line)
+
+
+def log(message: str, force: bool = False) -> None:
+    """写日志：只把这一行丢进队列，落盘交给专门的写线程。
+
+    界面线程（鼠标钩子就在它上面）**绝不**因为磁盘 / 杀毒软件卡住而停顿——
+    上一轮"未响应"的现场里，看门狗自己就卡在 log() 的锁上排队。
+    """
     if not force and not verbose_log:
         # 非强制日志里，只有鼠标事件会被跳过（它最频繁，也最没用）
         if message.startswith("鼠标事件"):
             return
     line = "%s  %s" % (time.strftime("%H:%M:%S"), message)
-    with log_lock:
-        try:
-            with open(log_path, "a", encoding="utf-8") as fh:
-                fh.write(line + "\n")
-            _log_size += len(line.encode("utf-8")) + 1
-            if _log_size > LOG_MAX_BYTES:
-                with open(log_path, encoding="utf-8") as fh:
-                    tail = fh.readlines()[-300:]
-                with open(log_path, "w", encoding="utf-8") as fh:
-                    fh.writelines(tail)
-                _log_size = sum(len(t.encode("utf-8")) for t in tail)
-        except OSError:
-            pass
-    print(line, flush=True)
+    global _log_writer_started
+    if not _log_writer_started:
+        _log_writer_started = True
+        threading.Thread(target=_log_writer, name="pet-log", daemon=True).start()
+    _log_queue.put(line)
+    try:
+        print(line, flush=True)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def install_stack_dumps() -> None:
+    """每 15 秒把所有线程的调用栈写进 pet-stacks.log（诊断"未响应"用）。
+
+    faulthandler 的定时器是**独立的 C 线程**：哪怕界面线程卡在某个 COM / sqlite 调用里，
+    它也能把当时的栈写出来 —— 卡死时这份文件就是第一现场。
+    每次启动重写（只保留本次运行），想关掉就设环境变量 CODEXPET_NO_STACKDUMP=1。
+    """
+    if os.environ.get("CODEXPET_NO_STACKDUMP"):
+        return
+    try:
+        import faulthandler
+
+        handle = open(os.path.join(HERE, "pet-stacks.log"), "w", encoding="utf-8", buffering=1)
+        faulthandler.dump_traceback_later(15.0, repeat=True, file=handle, exit=False)
+        log("线程栈快照已开启：每 15 秒写一份 pet-stacks.log（只在排查卡死时有用）")
+    except Exception as exc:  # noqa: BLE001
+        log("开启线程栈快照失败（不影响使用）：%r" % (exc,))
 
 
 def install_exception_logging() -> None:
@@ -189,6 +298,36 @@ def save_position(x: int, y: int) -> None:
         pass
 
 
+def load_settings_window_rect():
+    """设置窗口上次摆好的矩形 (x, y, 宽, 高)；没存过或者存坏了返回 None。"""
+    try:
+        with open(SETTINGS_WINDOW_FILE, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return int(data["x"]), int(data["y"]), int(data["width"]), int(data["height"])
+    except Exception:      # noqa: BLE001
+        return None
+
+
+def save_settings_window_rect(x, y, width, height) -> None:
+    try:
+        with open(SETTINGS_WINDOW_FILE, "w", encoding="utf-8") as fh:
+            json.dump(
+                {"x": int(x), "y": int(y), "width": int(width), "height": int(height)},
+                fh,
+            )
+    except OSError:
+        pass
+
+
+def fit_window_rect(area, x, y, width, height, min_w: int = 520, min_h: int = 520):
+    """把窗口矩形夹进工作区：宽高不超工作区、不小于窗口最小尺寸，位置保证整块可见。"""
+    width = max(min_w, min(int(width), max(min_w, area.Width - 8)))
+    height = max(min_h, min(int(height), max(min_h, area.Height - 8)))
+    x = max(area.Left + 4, min(int(x), area.Right - width - 4))
+    y = max(area.Top + 4, min(int(y), area.Bottom - height - 4))
+    return x, y, width, height
+
+
 def startup_link_path() -> str:
     return os.path.join(
         os.environ.get("APPDATA", ""),
@@ -201,20 +340,39 @@ def startup_link_path() -> str:
     )
 
 
-def codex_watch_link_path() -> str:
-    return os.path.join(
-        os.environ.get("APPDATA", ""),
-        "Microsoft",
-        "Windows",
-        "Start Menu",
-        "Programs",
-        "Startup",
-        "CodexPetWatcher.lnk",
-    )
+def desktop_dir() -> str:
+    """当前用户的桌面目录（处理 OneDrive/重定向；测试可用 CODEXPET_DESKTOP 覆盖）。"""
+    override = os.environ.get("CODEXPET_DESKTOP")
+    if override and os.path.isdir(override):
+        return override
+    try:
+        import winreg
+
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders",
+        )
+        try:
+            value, _ = winreg.QueryValueEx(key, "Desktop")
+        finally:
+            key.Close()
+        path = os.path.expandvars(str(value or ""))
+        if path:
+            return path
+    except Exception:      # noqa: BLE001
+        pass
+    return os.path.join(os.environ.get("USERPROFILE", os.path.expanduser("~")), "Desktop")
 
 
-def codex_follow_enabled() -> bool:
-    return os.path.exists(codex_watch_link_path())
+def desktop_link_path() -> str:
+    return os.path.join(desktop_dir(), "Agent 桌宠.lnk")
+
+
+def desktop_link_exists() -> bool:
+    try:
+        return os.path.exists(desktop_link_path())
+    except Exception:      # noqa: BLE001
+        return False
 
 
 def compute_card_position(pet, card_size, area, gap: int = CARD_GAP, head_offset: int = 0):
@@ -284,21 +442,25 @@ class MouseTracker:
     def feed(self, x: float, y: float, left: bool, right: bool, on_char: bool, on_head: bool, now: float) -> list[str]:
         events: list[str] = []
 
+        # 先算"按下之后移动了多远"：必须在松开判定之前算好，
+        # 否则"按下→松开"中间没有别的 poll 时，松开那一下看到的是 0。
+        if self.press_button:
+            self.moved = max(self.moved, abs(x - self.press_pos[0]) + abs(y - self.press_pos[1]))
+            # 必须在处理 release 之前把 drag-start 判出来。否则一次“按下→移动→松开”
+            # 全发生在两次轮询之间时，release 看到 dragging=False，会把快速拖动误判成单击。
+            if self.press_on_char and not self.dragging and self.moved > self.DRAG_THRESHOLD:
+                self.dragging = True
+                events.append("drag-start")
+
         if left and not self.left_down:
             self._press("left", x, y, on_char, on_head, now)
         elif not left and self.left_down:
-            self._release(events, now)
+            self._release(events, now, on_char)
 
         if right and not self.right_down:
             self._press("right", x, y, on_char, on_head, now)
         elif not right and self.right_down:
-            self._release(events, now)
-
-        if self.press_button:
-            self.moved = max(self.moved, abs(x - self.press_pos[0]) + abs(y - self.press_pos[1]))
-            if self.press_on_char and not self.dragging and self.moved > self.DRAG_THRESHOLD:
-                self.dragging = True
-                events.append("drag-start")
+            self._release(events, now, on_char)
 
         events += self.tick(now)
         return events
@@ -324,11 +486,23 @@ class MouseTracker:
         self.moved = 0.0
         self.dragging = False
 
-    def _release(self, events: list[str], now: float) -> None:
+    def _release(self, events: list[str], now: float, on_char_now: bool = True) -> None:
+        """松开：一次点击要求"按下和松开都压在角色像素上"。
+
+        只判按下的话，在角色边缘按下、手指挪到旁边的透明处再松手，就变成
+        "桌宠弹菜单 + 穿透出去给桌面弹菜单"同时发生（截图里那种两个菜单）。
+        """
         button = self.press_button
         dragged = self.dragging
         quick = (now - self.press_at) < self.CLICK_MAX_SECONDS
-        on_char = self.press_on_char
+        # 判定规则（按下/松开两个时刻的像素结论一起看）：
+        #  * 原地点击（几乎没移动）——任一时刻判在角色上都算：按下那一瞬间的结论可能比
+        #    网页采样慢半拍，只认它的话就会出现"右键明明点在角色上却没反应"；
+        #  * 有位移（拖动级别）——要求按下和松开都在角色上，免得从别处拖进来松手也算点击。
+        if self.moved <= self.DRAG_THRESHOLD:
+            on_char = on_char_now or self.press_on_char
+        else:
+            on_char = on_char_now and self.press_on_char
         on_head = self.press_on_head
 
         self.dragging = False
@@ -583,6 +757,7 @@ class PetHost:
         self.webview = None
         self.settings_window = None
         self.settings_webview = None
+        self._aux_hwnds = set()          # 已注册的设置/卡片等辅助顶层窗口（钩子输入隔离）
         self._expressions = None
         self._motions = None
         self._props = None
@@ -599,6 +774,7 @@ class PetHost:
         self.last_stop_check = 0.0
         self.char_rect = None
         self.head_rect = None
+        self.web_dpr = None           # 网页自己报的 devicePixelRatio（换算光标坐标要用它，别用猜的）
         self.over_char = None
         self.alpha_probe_ok = False
         self.zoom_lock_until = 0.0
@@ -606,10 +782,32 @@ class PetHost:
         self.pending_wheel = 0
         self.wheel_at = 0.0
         self._wheel_hook = None
+        self._hook_stalled = False      # 看门狗用：界面线程卡住时先把钩子摘掉
+        self._hook_watchdog = False     # 看门狗只起一次
+        self._ui_heartbeat = time.time()  # 界面线程心跳（每个 tick 刷新）
+        self._ui_phase = "启动"            # 界面线程"最后在做什么"，看门狗报警时写进日志
+        self._settings_signature = None  # 上次发出去的设置内容指纹（内容没变就不重发）
+        self._settings_pushed_at = 0.0
+        self._fps_protect_until = 0.0    # 卡顿保护：这段时间内把渲染帧率压到 60
+        self._stall_started = 0.0
+        self._settings_outbox = None    # 待发给设置窗口的最新一条消息（合并用）
+        self._settings_posting = False
+        self._settings_post_started = 0.0
+        self._settings_post_warned = False
+        self._flush_started = 0.0       # 正在给桌宠页面发的这条消息什么时候开始的
+        self._flush_warned = False
+        self.agent_status_cache = {}    # 各 agent 的本地记录检测结果（后台线程算，界面只读）
+        self.agent_status_at = 0.0
+        self.agent_status_busy = False
+        self._cache_size_bytes = 0        # WebView2 缓存占用（后台线程量，设置页只读）
+        self._cache_size_at = 0.0
+        self._cache_size_busy = False
+        self._cache_size_ready = False
         self.form_input_works = False
         self.card = None
         self.card_webview = None
-        self.inline_card_open = False
+        # 进度卡片开着没：按上次关掉桌宠时的状态来（settings_store 的 cardOpen，默认收起）
+        self.inline_card_open = bool((self.settings or {}).get("cardOpen", False))
         self.card_want_visible = False
         self.last_payload = None
         self.last_card_pos = None
@@ -642,10 +840,34 @@ class PetHost:
         self.fps_log_at = 0.0
         self.last_drag_log = 0.0
         self.menu = None
+        self.agent_picker = None        # 右键菜单「切换卡片 Agent」弹的快速选择面板（见 open_agent_picker）
         self.tray_icon = None
         self.edit_mode = False
         self.position_locked = False
         self.last_bottom_action = None
+        # 系统菜单屏蔽用：ctypes 的窗口过程回调必须留引用，被 GC 掉会直接崩
+        self._wndproc = None
+        self._old_wndproc = None
+        self._press_captured = False    # 拖动期间是否抓着鼠标（见 start_drag_loop/finish_drag）
+        self._hwnd_int = None           # 窗口句柄缓存：鼠标钩子里不能去碰 CLR 对象
+        self._rect_cache = None         # 窗口矩形缓存：钩子里算"光标在不在窗口里"用
+        self._right_swallowed = False   # 这一次右键是不是已经被我们吃掉了
+        self._left_swallowed = False    # 左键同理：按下/抬起都在钩子里成对吃掉
+        self._left_swallow_log = False  # 吃掉左键的诊断标记，回到 tick 里再写日志
+        self._ls_down_at = None         # 被吃掉的这次左键：按下位置（诊断/兜底用）
+        self._ls_down_time = 0.0        # 被吃掉的这次左键：按下时刻
+        self._hook_mouse_steps = []     # 钩子记录的左键 DOWN/UP 脉冲，tick 里按原顺序入状态机
+        self._swallow_log = False       # 吃掉之后留个标记，回到 tick 里再写日志
+        self._rs_down_at = None         # 被吃掉的这次右键：按下时的光标位置
+        self._rs_down_time = 0.0        # 同上：按下时刻（超时兜底用）
+        self._rs_peak = 0               # 被吃掉的这次右键：按住期间移动了多少
+        self._pending_menu_at = None    # 待弹出菜单的位置（钩子决定，tick 里执行）
+        self._menu_shown_at = 0.0       # 上一次弹菜单的时间（防止两条路径各弹一次）
+        self._menu_visible = False      # 菜单是不是开着（钩子里只读这个缓存，不碰 CLR）
+        self._menu_rect = None          # 菜单的屏幕矩形：用来判断左键点在菜单里还是外面
+        self._menu_pos = None           # 菜单左上角（屏幕坐标）：快速切换面板就弹在同一个位置
+        self._menu_close_at = 0.0       # "点了菜单外面"的兜底关闭请求（带时间戳，1 秒后作废）
+        self._ignore_click_until = 0.0  # 这一下点击属于菜单/下层窗口，别让底下的图标按钮跟着响应
 
     # -- window construction -------------------------------------------------
 
@@ -667,7 +889,7 @@ class PetHost:
         self.Point = Point
 
         form = Form()
-        form.Text = "Codex 桌宠"
+        form.Text = "Agent 桌宠"
         form.FormBorderStyle = getattr(FormBorderStyle, "None")
         form.StartPosition = FormStartPosition.Manual
         form.ShowInTaskbar = False
@@ -681,7 +903,7 @@ class PetHost:
         area = Screen.PrimaryScreen.WorkingArea
         dpi = user32.GetDpiForWindow(ctypes.c_void_p(int(form.Handle.ToInt64())))
         self.dpi_scale = (dpi or 96) / 96.0
-        self.pet_scale = float(self.settings.get("scale", 1.0))
+        self.pet_scale = max(SCALE_MIN, float(self.settings.get("scale", 1.0)))
         physical_w = int(round(WINDOW_W * self.dpi_scale * self.pet_scale))
         physical_h = int(round(WINDOW_H * self.dpi_scale * self.pet_scale))
         form.ClientSize = Size(physical_w, physical_h)
@@ -817,17 +1039,80 @@ class PetHost:
 
     def on_shown(self, sender, args) -> None:
         self.install_wheel_hook()
+        self.suppress_system_menu()
         self.desktops = VirtualDesktops()
         self.desktops.follow(self.form.Handle.ToInt64())
+
+    # -- 屏蔽窗口系统菜单 ----------------------------------------------------
+
+    def suppress_system_menu(self) -> None:
+        """右键不再弹出 Windows 的窗口系统菜单（还原 / 移动 / 大小 / 关闭）。
+
+        网页那边把右键默认行为拦掉之后，没被消费的 WM_CONTEXTMENU 会冒泡到宿主窗口的
+        默认处理；无边框窗口只要还带着 WS_SYSMENU，DefWindowProc 就照着"在标题栏上
+        点了右键"的老规矩把系统菜单弹出来。两道保险：去掉 WS_SYSMENU + 在窗口过程里
+        直接吃掉右键相关消息。
+
+        （窗口过程回调是 ctypes 直接交给系统的，必须存成成员变量 —— 被 Python 回收掉
+        之后系统再回调就会崩；换 Handle 之后要重新装，所以放在 on_shown 里。）
+        """
+        try:
+            hwnd = wt.HWND(self.form.Handle.ToInt64())
+            style = user32.GetWindowLongW(hwnd, GWL_STYLE) & 0xFFFFFFFF
+            if style & WS_SYSMENU:
+                user32.SetWindowLongW(hwnd, GWL_STYLE, style & ~WS_SYSMENU)
+
+            LRESULT = ctypes.c_ssize_t
+            WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wt.HWND, ctypes.c_uint, wt.WPARAM, wt.LPARAM)
+            user32.SetWindowLongPtrW.restype = ctypes.c_void_p
+            user32.SetWindowLongPtrW.argtypes = [wt.HWND, ctypes.c_int, ctypes.c_void_p]
+            user32.CallWindowProcW.restype = LRESULT
+            user32.CallWindowProcW.argtypes = [ctypes.c_void_p, wt.HWND, ctypes.c_uint, wt.WPARAM, wt.LPARAM]
+
+            def wnd_proc(h, msg, wparam, lparam):
+                if msg in (WM_CONTEXTMENU, WM_NCRBUTTONUP):
+                    return 0
+                if msg == WM_PET_CLOSE_MENU:
+                    # 鼠标钩子发现"左键点在菜单外面"时发过来的：
+                    # 在这里关菜单（消息循环里，随便调 .NET 都安全；钩子里不能这么干）。
+                    # 只认 1 秒内的请求：万一这条消息晚到（下一次菜单已经弹出），也不能误关。
+                    if self._menu_close_at and time.time() - self._menu_close_at < 1.0:
+                        self._menu_close_at = 0.0
+                        try:
+                            if self.menu is not None and not self.menu.IsDisposed and self.menu.Visible:
+                                self.menu.Close()
+                        except Exception:  # noqa: BLE001
+                            pass
+                    return 0
+                return user32.CallWindowProcW(self._old_wndproc, h, msg, wparam, lparam)
+
+            self._wndproc = WNDPROC(wnd_proc)
+            old = user32.SetWindowLongPtrW(
+                hwnd, GWL_WNDPROC, ctypes.cast(self._wndproc, ctypes.c_void_p)
+            )
+            if not old:
+                self._wndproc = None
+                log("窗口过程替换失败，右键可能还会冒出系统菜单")
+                return
+            self._old_wndproc = old
+            log("已屏蔽窗口系统菜单（原 WS_SYSMENU=%s）" % bool(style & WS_SYSMENU))
+        except Exception as exc:  # noqa: BLE001
+            log("屏蔽系统菜单失败：%r" % (exc,))
 
     # -- webview plumbing ----------------------------------------------------
 
     def on_webview_ready(self, sender, args) -> None:
         core = sender.CoreWebView2
         if core is None:
+            # 重启时旧实例的 WebView2 子进程可能还没放开 .webview2 用户数据目录，
+            # 新实例就会拿到 0x800700AA（资源在使用中）/ 拒绝访问。这类是暂时性的：
+            # 先退避重试几次，重试用完还不行才弹提示框。
+            if self.retry_webview_init(args.InitializationException):
+                return
             log("WebView2 初始化失败：%s" % args.InitializationException)
             self.report_fatal("WebView2 初始化失败", args.InitializationException)
             return
+        self._webview_init_tries = 0
         core.Settings.AreDefaultContextMenusEnabled = False
         core.Settings.IsZoomControlEnabled = False
         core.Settings.AreDevToolsEnabled = bool(os.environ.get("CODEXPET_DEVTOOLS"))
@@ -857,6 +1142,42 @@ class PetHost:
             log("WebView2 就绪，正在加载界面")
         core.NavigationCompleted += self.on_navigation_done
 
+    _WEBVIEW_RETRY_DELAYS = (1.0, 2.0, 3.0, 5.0)
+
+    def retry_webview_init(self, exc) -> bool:
+        """初始化失败就退避重试；返回 True 表示已排好下一次重试。
+
+        最常见的失败是重启竞态：旧实例刚被杀掉，WebView2 运行时还占着同一个
+        .webview2 用户数据目录（0x800700AA 资源在使用中 / 拒绝访问）。
+        隔几秒再试基本都能成功，不该直接弹错误框。
+        """
+        tries = int(getattr(self, "_webview_init_tries", 0) or 0)
+        delays = self._WEBVIEW_RETRY_DELAYS
+        if tries >= len(delays) or self.webview is None:
+            return False
+        delay = delays[tries]
+        self._webview_init_tries = tries + 1
+        log("WebView2 初始化失败（第 %d 次）：%s；%.0f 秒后重试" % (tries + 1, exc, delay))
+
+        def retry_ui() -> None:
+            try:
+                self.webview.EnsureCoreWebView2Async(None)
+            except Exception as exc2:      # noqa: BLE001
+                log("WebView2 重试调用失败：%r" % (exc2,))
+                if not self.retry_webview_init(exc2):
+                    self.report_fatal("WebView2 初始化失败", exc2)
+
+        def schedule() -> None:
+            time.sleep(delay)
+            try:
+                from System import Action
+                self.form.BeginInvoke(Action(retry_ui))
+            except Exception as exc2:      # noqa: BLE001
+                log("WebView2 重试调度失败：%r" % (exc2,))
+
+        threading.Thread(target=schedule, daemon=True).start()
+        return True
+
     def report_fatal(self, title: str, detail) -> None:
         """出错时弹一个提示框，但绝不卡住：① 可以用环境变量抑制；② 25 秒后自动关掉。"""
         if os.environ.get("CODEXPET_NO_DIALOG"):
@@ -869,7 +1190,7 @@ class PetHost:
 
                 MessageBox.Show(
                     "%s\n\n%s\n\n详细信息见日志：%s" % (title, detail, log_path),
-                    "Codex 桌宠",
+                    "Agent 桌宠",
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Warning,
                 )
@@ -879,7 +1200,7 @@ class PetHost:
         def auto_close() -> None:
             time.sleep(25)
             try:
-                hwnd = user32.FindWindowW(None, "Codex 桌宠")
+                hwnd = user32.FindWindowW(None, "Agent 桌宠")
                 if hwnd:
                     user32.PostMessageW(hwnd, 0x0010, 0, 0)   # WM_CLOSE
             except Exception:
@@ -929,6 +1250,8 @@ class PetHost:
             rect = msg.get("rect") or [0, 0, 0, 0]
             head = msg.get("headRect") or None
             dpr = float(msg.get("dpr") or 1.0)
+            if dpr > 0:
+                self.web_dpr = dpr
             self.char_rect = (rect[0] * dpr, rect[1] * dpr, rect[2] * dpr, rect[3] * dpr)
             self.head_rect = (
                 (head[0] * dpr, head[1] * dpr, head[2] * dpr, head[3] * dpr) if head else None
@@ -946,10 +1269,32 @@ class PetHost:
                     % (self.render_fps, self.form.ClientSize.Width, self.form.ClientSize.Height, self.pet_scale)
                 )
         elif kind == "over":
-            self.over_char = bool(msg.get("value"))
+            value = bool(msg.get("value"))
+            if value != self.over_char and (verbose_log or os.environ.get("CODEXPET_TRACE_HIT")):
+                log(
+                    "像素命中：%s（网页采样 x=%s y=%s alpha=%s；窗口 %s；光标 %s）"
+                    % (
+                        "角色身上" if value else "透明处（这次点击会穿给桌面）",
+                        msg.get("x"),
+                        msg.get("y"),
+                        msg.get("alpha"),
+                        (self.form.Left, self.form.Top),
+                        self.last_cursor[:2] if self.last_cursor else None,
+                    )
+                )
+            self.over_char = value
         elif kind == "over-probe":
             self.alpha_probe_ok = bool(msg.get("value"))
-            log("像素命中检测：%s" % ("可用" if self.alpha_probe_ok else "不可用，退回角色外框判断"))
+            # 画布/CSS/dpr 一起记下来：排查"采样点和光标对不上"时要靠它换算
+            log(
+                "像素命中检测：%s（画布 %s / CSS %s / dpr %s）"
+                % (
+                    "可用" if self.alpha_probe_ok else "不可用，退回角色外框判断",
+                    msg.get("canvas"),
+                    msg.get("css"),
+                    msg.get("dpr"),
+                )
+            )
         elif kind == "panel":
             self.panel_open = bool(msg.get("open"))
         elif kind == "resize":
@@ -965,7 +1310,7 @@ class PetHost:
         elif kind == "reload":
             self.reload_page()
         elif kind == "open-codex":
-            self.focus_codex()
+            self.focus_agent_window()       # 设置页那个"切到窗口"按钮：跟当前 agent 走
         elif kind == "ready":
             self.ready.set()
             extra = ""
@@ -973,6 +1318,9 @@ class PetHost:
                 extra = " webgl=%s 像素=%s" % (msg.get("webgl"), msg.get("pixel"))
             log("界面就绪，形象表情数量：%d%s" % (len(msg.get("expressions") or []), extra))
             self.push_settings()
+            # 页面刚（重新）加载完时，网页里的卡片状态是默认的“收起” ——
+            # 这里按宿主记录的当前状态补一条，否则“重新载入形象”之后卡片会莫名消失。
+            self.post({"t": "card", "open": self.inline_card_open})
         elif kind == "status":
             self.status = msg.get("data") or {}
             self.status_ready.set()
@@ -993,20 +1341,67 @@ class PetHost:
             self.queue.append(message)
 
     def flush(self) -> None:
+        self.ui_phase("发送消息给页面")
         with self.lock:
             pending, self.queue = self.queue, []
         if not pending or self.webview is None or self.webview.CoreWebView2 is None:
             return
         for message in pending:
             try:
+                started = time.time()
+                self._flush_started = started
+                self._flush_warned = False
                 self.webview.CoreWebView2.PostWebMessageAsJson(json.dumps(message, ensure_ascii=False))
+                self._flush_started = 0.0
+                spent = time.time() - started
+                if spent > 0.3:
+                    # WebView2（浏览器进程）忙的时候这一步会卡住界面线程 —— 记下来，好定位
+                    log("发给页面的 %s 消息耗时 %.1f 秒（WebView2 忙）" % (message.get("t"), spent))
+                if spent > 1.0:
+                    self.protect_fps("给页面发消息 %.1f 秒" % spent)
             except Exception as exc:  # noqa: BLE001
                 log("发送状态失败：%r" % (exc,))
 
     # -- per-frame work ------------------------------------------------------
 
+    def ui_phase(self, text: str) -> None:
+        """记下界面线程当前在做的事（纯字符串赋值，开销可忽略）。"""
+        self._ui_phase = text
+
     def on_tick(self, sender, args) -> None:
+        now = time.time()
+        gap = now - self._ui_heartbeat
+        if gap > 0.8:
+            # 2 秒以上的严重卡顿归看门狗；0.8~2 秒的小停顿也记一笔，方便对着时间线查
+            log("界面线程停顿 %.1f 秒（最后在做：%s）" % (gap, self._ui_phase))
+        self._ui_heartbeat = now             # 给看门狗看：界面线程还活着
+        self.ui_phase("界面 tick")
         self.flush()
+        self.refresh_rect_cache()
+        # 兜底：万一抬起事件没来（钩子被摘、远程桌面抢走之类），别让右键一直处于"被吃掉"状态
+        if self._right_swallowed and time.time() - self._rs_down_time > 5.0:
+            self._right_swallowed = False
+            self._rs_down_at = None
+            log("右键状态超时，已复位（兜底）")
+        if self._swallow_log:
+            self._swallow_log = False
+            log("已在系统分发前吃掉这一次右键：下面的窗口收不到，不会弹它的菜单")
+        if self._left_swallow_log:
+            self._left_swallow_log = False
+            log("已在系统分发前吃掉这一次左键：下面的窗口收不到，不会选中文字/误点图标")
+        if self._menu_visible:
+            rect = self.menu_screen_rect()
+            if rect:
+                self._menu_rect = rect
+        if self._menu_close_at:
+            if time.time() - self._menu_close_at > 1.0:
+                self._menu_close_at = 0.0      # 过期作废：绝不能影响到下一次菜单
+            elif self._menu_visible:
+                self._menu_close_at = 0.0
+                try:
+                    self.menu.Close()
+                except Exception as exc:  # noqa: BLE001
+                    log("关闭右键菜单失败：%r" % (exc,))
         self.handle_mouse()
         self.drain_wheel()
 
@@ -1040,11 +1435,27 @@ class PetHost:
 
     # 鼠标事件不走网页（透明窗口是分层的，子窗口收不到点击），这里直接读键鼠状态来驱动互动
     def handle_mouse(self) -> None:
+        # 必须先消费钩子记录的 DOWN/UP。用户在两次 33ms 轮询之间完成一次快速点击时，
+        # 只看“当前按键状态”会连按下都没见到；队列保留完整脉冲，所以单击不会丢。
+        self.drain_hook_mouse_steps()
         if self.form_input_works:
             return   # 已经能收到真实的窗口鼠标事件，就不再用轮询凑
+        if self._menu_visible or time.time() < self._ignore_click_until:
+            # 菜单开着（或刚被“点菜单外面”关掉）的这一下：鼠标操作归菜单和下层窗口，
+            # 底层一律不判定 —— 否则菜单浮在哪，就会连带触发它下面的那个图标按钮
+            # （点“重新载入形象”顺手触发橡皮擦，就是这么来的）。
+            self.mouse.pending_single = 0.0     # 丢掉排队中的单击，免得菜单一关就补触发
+            return
         cursor = wt.POINT()
         user32.GetCursorPos(ctypes.byref(cursor))
-        left = bool(user32.GetAsyncKeyState(0x01) & 0x8000)
+        # 设置窗口、卡片、对话框等同进程窗口可能压在桌宠上面。它们的坐标仍落在
+        # 桌宠矩形里，但输入必须归上层窗口；否则滑设置选项会同时缩放/拖动桌宠。
+        if self.point_on_input_blocker((cursor.x, cursor.y)) and not self._left_swallowed and not self.mouse.dragging:
+            self.mouse.pending_single = 0.0
+            return
+        # 左键被钩子吞掉后 GetAsyncKeyState 不再可靠；用钩子维护的“逻辑按下状态”
+        # 驱动原来的 MouseTracker。这样单击/双击/拖动状态机不用重写，也不会漏掉松手。
+        left = self._left_swallowed or bool(user32.GetAsyncKeyState(0x01) & 0x8000)
         right = bool(user32.GetAsyncKeyState(0x02) & 0x8000)
         now = time.time()
 
@@ -1055,10 +1466,140 @@ class PetHost:
         inside = 0 <= local_x < width and 0 <= local_y < height
         locked = now < self.zoom_lock_until      # 缩放的瞬间不接受拖动，避免互相打架
         on_char = inside and not locked and self.on_character(local_x, local_y)
+        if self._left_swallowed:
+            # 按下已经在钩子里确认过“角色像素”，别让网页异步采样的滞后把这次拖动否掉。
+            on_char = inside and not locked
         on_head = on_char and self.on_head(local_x, local_y)
 
         for event in self.mouse.feed(cursor.x, cursor.y, left, right, on_char, on_head, now):
             self.on_mouse_event(event, cursor, now)
+
+    def drain_hook_mouse_steps(self) -> None:
+        """把钩子保存的左键 DOWN/UP 依次喂给 MouseTracker。
+
+        钩子回调本身只做命中判断、保存普通元组和返回 0/1；业务动作全部延后到这里。
+        这样既不会让 WH_MOUSE_LL 因日志/CLR 调用超时，也能保住“按下→松开都发生在
+        两次轮询之间”的快速单击和双击。
+        """
+        if not self._hook_mouse_steps:
+            return
+        steps, self._hook_mouse_steps = self._hook_mouse_steps, []
+        for phase, xy, at in steps:
+            left_down = phase == "down"
+            x, y = xy
+            if self._rect_cache:
+                local_x = x - self._rect_cache[0]
+                local_y = y - self._rect_cache[1]
+            else:
+                local_x, local_y = x, y
+            # DOWN 已经在钩子里确认过角色像素；UP 继续按“在角色上”处理，
+            # 小幅抖到透明边缘时仍按项目原规则算一次点击，拖动则由 drag-end 收尾。
+            on_char = True
+            on_head = left_down and self.on_head(local_x, local_y)
+            events = self.mouse.feed(x, y, left_down, False, on_char, on_head, at)
+            cursor = wt.POINT(int(x), int(y))
+            for event in events:
+                self.on_mouse_event(event, cursor, at)
+
+    def _cursor_xy(self):
+        """钩子里用的极简取点：只读一次 GetCursorPos，不做别的。"""
+        cursor = wt.POINT()
+        if not user32.GetCursorPos(ctypes.byref(cursor)):
+            return None
+        return (cursor.x, cursor.y)
+
+    def register_aux_window(self, form) -> None:
+        """登记一个必须优先接收输入的辅助顶层窗口。"""
+        try:
+            self._aux_hwnds.add(int(form.Handle.ToInt64()))
+        except Exception:
+            pass
+
+    def unregister_aux_window(self, form) -> None:
+        try:
+            self._aux_hwnds.discard(int(form.Handle.ToInt64()))
+        except Exception:
+            pass
+
+    def point_on_auxiliary(self, xy) -> bool:
+        """这个点是不是落在本桌宠进程的辅助窗口上（设置/卡片/对话框/快速面板）？
+
+        WindowFromPoint 对色键透明的桌宠本体可能答“下面的窗口”，但对不透明的设置窗口
+        是可靠的。这里只用它做**排除**：命中同进程、非桌宠顶层窗口就绝不把输入当桌宠的。
+        """
+        if not xy:
+            return False
+        for hwnd in list(self._aux_hwnds):
+            rect = wt.RECT()
+            if user32.GetWindowRect(wt.HWND(hwnd), ctypes.byref(rect)):
+                if rect.left <= xy[0] < rect.right and rect.top <= xy[1] < rect.bottom:
+                    return True
+        box = self._menu_rect
+        if box and box[0] <= xy[0] < box[2] and box[1] <= xy[1] < box[3]:
+            return True
+        try:
+            owner = user32.WindowFromPoint(wt.POINT(int(xy[0]), int(xy[1])))
+            if not owner:
+                return False
+            root = user32.GetAncestor(wt.HWND(owner), GA_ROOT) or owner
+            root_int = int(root)
+            if root_int == int(self._hwnd_int or 0):
+                return False
+            pid = ctypes.c_ulong()
+            user32.GetWindowThreadProcessId(wt.HWND(root), ctypes.byref(pid))
+            return bool(pid.value and pid.value == os.getpid())
+        except Exception:
+            return False
+
+    def point_on_shell_overlay(self, xy) -> bool:
+        """光标是不是落在任务栏/开始菜单等 Shell 覆盖层上。
+
+        对桌宠本体，色键透明会让 WindowFromPoint 答“下面的窗口”，所以不能把
+        “不是桌宠”一概当遮挡；这里只认明确的 Shell 覆盖层类，稳定且不会误伤桌宠。
+        """
+        if not xy:
+            return False
+        try:
+            owner = user32.WindowFromPoint(wt.POINT(int(xy[0]), int(xy[1])))
+            if not owner:
+                return False
+            root = user32.GetAncestor(wt.HWND(owner), GA_ROOT) or owner
+            buf = ctypes.create_unicode_buffer(128)
+            user32.GetClassNameW(wt.HWND(root), buf, 128)
+            return buf.value in SHELL_OVERLAY_CLASSES
+        except Exception:
+            return False
+
+    def point_on_input_blocker(self, xy) -> bool:
+        """任何应当优先接收鼠标输入、阻止桌宠响应的覆盖窗口。"""
+        return bool(self.point_on_auxiliary(xy) or self.point_on_shell_overlay(xy))
+
+    def pointer_on_pet(self, xy=None) -> bool:
+        """鼠标钩子专用，必须极快：当前这一下是不是点在角色像素上？
+
+        左右键共用同一套命中结论：只看两个现成的缓存 —— 网页报来的像素结论
+        over_char、窗口矩形 _rect_cache —— 不写日志、不碰 CLR 属性
+        （低层钩子回调慢一点就会被系统摘掉）。xy 可复用钩子刚取到的坐标。
+        """
+        if not self.over_char or not self._rect_cache:
+            return False
+        left, top, right, bottom = self._rect_cache
+        if xy is None:
+            xy = self._cursor_xy()
+        return bool(xy and not self.point_on_input_blocker(xy) and left <= xy[0] < right and top <= xy[1] < bottom)
+
+    def right_click_on_pet(self) -> bool:
+        """兼容旧调用名；右键命中现在和左键共用 pointer_on_pet()。"""
+        return self.pointer_on_pet()
+
+    def wheel_on_pet(self, xy) -> bool:
+        """滚轮缩放专用命中：设置等辅助窗口优先排除，再沿用像素/外框判断。"""
+        if not self._rect_cache or self.point_on_input_blocker(xy):
+            return False
+        left, top, right, bottom = self._rect_cache
+        if not (left <= xy[0] < right and top <= xy[1] < bottom):
+            return False
+        return self.on_character(xy[0] - left, xy[1] - top)
 
     def on_head(self, local_x: float, local_y: float) -> bool:
         """头部区域：网页报了头框就用它，否则退回"角色上方 40%"。"""
@@ -1085,7 +1626,8 @@ class PetHost:
             return None
         fx = (local_x - rx) / rw
         fy = (local_y - ry) / rh
-        if abs(fy - TOOL_MARK_Y) > TOOL_MARK_HALF_Y:
+        dy = fy - TOOL_MARK_Y
+        if dy < -TOOL_MARK_HALF_Y_UP or dy > TOOL_MARK_HALF_Y_DOWN:
             return None
         best = None
         best_dx = TOOL_MARK_HALF_X
@@ -1097,6 +1639,9 @@ class PetHost:
 
     def on_mouse_event(self, event: str, cursor, now: float) -> None:
         log("鼠标事件：%s (%d,%d)" % (event, cursor.x, cursor.y))
+        if self._menu_visible or now < self._ignore_click_until:
+            # 这一下点击属于菜单（或刚关掉菜单后的下层窗口），别让底下的图标/摸头跟着响应
+            return
         local_x = cursor.x - self.form.Left
         local_y = cursor.y - self.form.Top
         tool = self.tool_zone(local_x, local_y)
@@ -1116,7 +1661,17 @@ class PetHost:
             if tool:
                 self.trigger_bottom_action(tool, "right", cursor)
             else:
-                self.show_menu(cursor.x, cursor.y)
+                # 只记录诊断、不做拦截：曾经在这里"系统说不是桌宠就不弹菜单"，结果
+                # 这台机器上 WindowFromPoint 对所有点都答"不是桌宠"，右键菜单直接全废。
+                # 要不要响应，仍然只由网页那边的像素判定说了算。
+                owner = self.point_owner_is_pet(cursor.x, cursor.y)
+                if owner is not True and (verbose_log or os.environ.get("CODEXPET_TRACE_HIT")):
+                    log(
+                        "落点诊断（不影响响应）：像素=%s 系统=%s %s"
+                        % ("角色身上" if self.over_char else "透明处", owner, self.describe_point_owner(cursor.x, cursor.y))
+                    )
+                if time.time() - self._menu_shown_at > 0.35:
+                    self.show_menu(cursor.x, cursor.y)
         elif event == "drag-start":
             if self.position_locked:
                 self.post({"t": "say", "text": "位置已锁定"})
@@ -1125,6 +1680,42 @@ class PetHost:
             self.start_drag_loop()
         elif event == "drag-end":
             self.finish_drag()   # 兜底：拖动定时器已经在盯着按键状态了
+
+    def point_owner_is_pet(self, screen_x: float, screen_y: float):
+        """问系统：这个点会被投给哪个窗口？True=桌宠 / False=别的窗口 / None=问不出来。
+
+        Windows 的点击穿透（色键洋红 + 分层窗口命中测试）是系统在投递鼠标消息时决定的；
+        我们轮询判断只是事后补一刀。所以真正要弹菜单/开始拖动之前，再问一次系统最可靠。
+        """
+        try:
+            owner = user32.WindowFromPoint(wt.POINT(int(screen_x), int(screen_y)))
+            if not owner:
+                return None
+            root = user32.GetAncestor(wt.HWND(owner), GA_ROOT) or owner
+            return int(root) == int(self.form.Handle.ToInt64())
+        except Exception as exc:  # noqa: BLE001
+            log("查询落点归属失败：%r" % (exc,))
+            return None
+
+    def describe_point_owner(self, screen_x: float, screen_y: float) -> str:
+        """诊断用：这个点系统认为归谁（类名 + 句柄），跟桌宠窗口句柄一起打出来。"""
+        try:
+            owner = user32.WindowFromPoint(wt.POINT(int(screen_x), int(screen_y)))
+            if not owner:
+                return "owner=<none>"
+            buf = ctypes.create_unicode_buffer(128)
+            user32.GetClassNameW(wt.HWND(owner), buf, 128)
+            root = user32.GetAncestor(wt.HWND(owner), GA_ROOT)
+            rname = "-"
+            if root:
+                rbuf = ctypes.create_unicode_buffer(128)
+                user32.GetClassNameW(wt.HWND(root), rbuf, 128)
+                rname = rbuf.value
+            return "owner=%s(0x%X) root=%s(0x%X) pet=0x%X" % (
+                buf.value, int(owner), rname, int(root) if root else 0, self.form.Handle.ToInt64()
+            )
+        except Exception as exc:  # noqa: BLE001
+            return "err=%r" % (exc,)
 
     def on_character(self, local_x: float, local_y: float, margin: float = 10) -> bool:
         """只有点在角色身上才算互动，透明边角就让点击穿过去。"""
@@ -1147,41 +1738,186 @@ class PetHost:
         self.zoom_by(steps * 0.06)
 
     def install_wheel_hook(self) -> None:
-        """底层鼠标钩子：窗口没焦点时也能收到滚轮，用来缩放桌宠。
+        """底层鼠标钩子：滚轮缩放 + 吃掉"点在角色上"的右键。
 
-        只在光标位于桌宠上时消费滚轮，避免影响别的程序。
+        这个窗口对鼠标几乎是全穿透的（系统不把鼠标消息投给桌宠），所以：
+        * 滚轮：只在光标位于角色像素上时才消费，避免影响别的程序；
+        * 右键：点在角色像素上就在系统分发之前吃掉（返回 1），下面的窗口收不到、
+          也就不会弹它自己的菜单；整条右键链路（按下→跟踪移动→抬起→弹菜单）
+          都在这里自己走完 —— 事件被丢弃后 GetAsyncKeyState 也读不到这次按键了。
         """
+        self._hwnd_int = self.form.Handle.ToInt64()
         WH_MOUSE_LL = 14
         WM_MOUSEWHEEL = 0x020A
+        WM_MOUSEMOVE = 0x0200
+        WM_LBUTTONDOWN, WM_LBUTTONUP = 0x0201, 0x0202
+        WM_RBUTTONDOWN, WM_RBUTTONUP = 0x0204, 0x0205
+        # CallNextHookEx 必须声明参数类型：lparam 在 64 位上是 64 位的，
+        # 不声明的话 ctypes 按 32 位整数传，稍微大一点的值就 OverflowError。
+        user32.PostMessageW.argtypes = [wt.HWND, ctypes.c_uint, wt.WPARAM, wt.LPARAM]
+        user32.CallNextHookEx.argtypes = [ctypes.c_void_p, ctypes.c_int, wt.WPARAM, wt.LPARAM]
+        user32.CallNextHookEx.restype = ctypes.c_void_p
         HOOKPROC = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_int, wt.WPARAM, wt.LPARAM)
 
         def hook(code, wparam, lparam):
-            if code >= 0 and wparam == WM_MOUSEWHEEL and self.settings.get("wheelZoom", True):
-                try:
-                    data = ctypes.cast(lparam, ctypes.POINTER(ctypes.c_ulong))
-                    mouse_data = data[2]  # MSLLHOOKSTRUCT.mouseData
-                    delta = ctypes.c_short((mouse_data >> 16) & 0xFFFF).value
-                    self.pending_wheel += delta
-                    self.wheel_at = time.time()
-                except Exception:
-                    pass
+            if code >= 0:
+                # 右键：如果这一下点在角色像素上，就直接把它从系统那里吃掉。
+                # 这台机器上桌宠窗口对鼠标是全穿透的（实测 WindowFromPoint 把角色像素
+                # 判给了 Progman/桌面），不吞的话下面的窗口会弹出它自己的菜单，
+                # 而且画在我们菜单上面 —— 用户看到的"只有系统菜单"就是这么来的。
+                # 钩子返回 1 = 这个事件不再往下传；松手那一下按同样的条件一起吞，
+                # 免得下面的窗口收到一个孤立的抬起。
+                # 菜单开着的时候，左键点在菜单外面：
+                # 这里只把菜单的鼠标捕获放掉（ToolStrip 失去捕获会自己 Dismiss），
+                # 并且**不吞**这个事件 —— 于是这一次点击既关掉菜单，又照常落到桌面上，
+                # 不用"第一次点只关菜单、第二次才生效"。点在菜单里面则一切照旧。
+                if wparam == WM_LBUTTONDOWN and self._menu_visible:
+                    xy = self._cursor_xy()
+                    box = self._menu_rect
+                    inside = bool(xy and box and box[0] <= xy[0] < box[2] and box[1] <= xy[1] < box[3])
+                    if xy and not inside:
+                        self._ignore_click_until = time.time() + 0.4   # 这一下点击别再触发底层按钮
+                        user32.ReleaseCapture()          # 先放开捕获：这一次左键就不会被菜单吃掉
+                        if self._hwnd_int:
+                            user32.PostMessageW(wt.HWND(self._hwnd_int), WM_PET_CLOSE_MENU, 0, 0)
+                        self._menu_close_at = time.time()   # 再留一道 tick 兜底（1 秒内有效）
+                # 左键：和已验证可用的右键走同一套“系统分发前吞掉”方案。
+                # 只有按下确认在角色像素上才开始吞；随后 MOVE 可以照常传给其他程序
+                # （对方从未收到 DOWN，因此不会进入选择/拖拽），UP 必须成对吞掉，
+                # 否则下层窗口会收到一个孤立的抬起。逻辑按键状态由 handle_mouse()
+                # 喂给 MouseTracker，因此这里绝不能在钩子回调里直接做业务/写日志。
+                if wparam == WM_LBUTTONDOWN and not self._menu_visible:
+                    down_xy = self._cursor_xy()
+                    if down_xy and self.pointer_on_pet(down_xy):
+                        now = time.time()
+                        self._left_swallowed = True
+                        self._left_swallow_log = True
+                        self._ls_down_at = down_xy
+                        self._ls_down_time = now
+                        self._hook_mouse_steps.append(("down", down_xy, now))
+                        return 1
+                if wparam == WM_LBUTTONUP and self._left_swallowed:
+                    up_xy = self._cursor_xy()
+                    now = time.time()
+                    self._left_swallowed = False
+                    self._ls_down_at = None
+                    self._hook_mouse_steps.append(("up", up_xy or (0, 0), now))
+                    return 1
+                if wparam == WM_RBUTTONDOWN and not self._menu_visible and self.pointer_on_pet():
+                    # 事件被吃掉之后，GetAsyncKeyState 那边可能就看不到这次按键了，
+                    # 所以整条右键链路必须在这里自己走完：记住按下位置 → 跟踪移动 → 抬起时决定弹菜单。
+                    self._right_swallowed = True
+                    self._swallow_log = True
+                    self._rs_down_at = self._cursor_xy()
+                    self._rs_down_time = time.time()
+                    self._rs_peak = 0
+                    return 1
+                if wparam == WM_MOUSEMOVE and self._right_swallowed:
+                    now_xy = self._cursor_xy()
+                    if now_xy and self._rs_down_at:
+                        far = abs(now_xy[0] - self._rs_down_at[0]) + abs(now_xy[1] - self._rs_down_at[1])
+                        if far > self._rs_peak:
+                            self._rs_peak = far
+                if wparam == WM_RBUTTONUP and self._right_swallowed:
+                    self._right_swallowed = False
+                    up_xy = self._cursor_xy()
+                    if up_xy and self._rs_peak <= 8:      # 没怎么动 = 一次正经右键，弹菜单
+                        self._pending_menu_at = up_xy
+                    self._rs_down_at = None
+                    return 1
+                if wparam == WM_MOUSEWHEEL and self.settings.get("wheelZoom", True):
+                    wheel_xy = self._cursor_xy()
+                    # 上层设置窗口/卡片/对话框里的滚轮必须原样交给它。以前只看桌宠矩形和
+                    # 缓存的 over_char，设置压在桌宠上时会被误认成“滚轮缩放桌宠”。
+                    if wheel_xy and self.wheel_on_pet(wheel_xy):
+                        try:
+                            data = ctypes.cast(lparam, ctypes.POINTER(ctypes.c_ulong))
+                            mouse_data = data[2]  # MSLLHOOKSTRUCT.mouseData
+                            delta = ctypes.c_short((mouse_data >> 16) & 0xFFFF).value
+                            self.pending_wheel += delta
+                            self.wheel_at = time.time()
+                            return 1
+                        except Exception:
+                            pass
             return user32.CallNextHookEx(None, code, wparam, lparam)
 
         self._hook_proc = HOOKPROC(hook)   # 必须留着引用，否则会被回收
         user32.SetWindowsHookExW.restype = ctypes.c_void_p
         self._wheel_hook = user32.SetWindowsHookExW(WH_MOUSE_LL, self._hook_proc, None, 0)
         log("滚轮钩子：%s" % ("已安装" if self._wheel_hook else "安装失败（改用窗口滚轮事件）"))
+        self.start_hook_watchdog()
+
+    def start_hook_watchdog(self) -> None:
+        """鼠标钩子看门狗：界面线程一旦卡住超过 2 秒，先把底层鼠标钩子摘掉。
+
+        为什么要有它：WH_MOUSE_LL 是"系统级"钩子 —— 它的回调必须由安装它的线程
+        （也就是界面线程）及时处理。万一界面线程被某个同步调用卡住（比如等一个
+        起不来的子进程），系统就会一直等我们，表现是**整台电脑的鼠标都动不了**。
+        真出这种事时，看门狗先把钩子摘掉让鼠标立刻恢复；界面线程缓过来再装回去。
+        """
+        if self._hook_watchdog:
+            return
+        self._hook_watchdog = True
+
+        def loop() -> None:
+            while True:
+                time.sleep(0.5)
+                try:
+                    gap = time.time() - self._ui_heartbeat
+                    stalled = gap > 2.0
+                    if gap > 1.5:
+                        self.protect_fps("界面线程停顿 %.1f 秒" % gap)
+                    if stalled and self._wheel_hook and not self._hook_stalled:
+                        self._hook_stalled = True
+                        self._stall_started = self._ui_heartbeat
+                        handle = self._wheel_hook
+                        self._wheel_hook = None
+                        # 钩子一旦被摘，成对的 UP 可能永远收不到。清掉钩子侧按钮状态，
+                        # 让下一次 tick 把 MouseTracker / 拖动状态正常释放。
+                        self._left_swallowed = False
+                        self._right_swallowed = False
+                        user32.UnhookWindowsHookEx(ctypes.c_void_p(handle))
+                        log("看门狗：界面线程卡住超过 2 秒（最后在做：%s），已临时摘掉鼠标钩子（鼠标应当立刻恢复）" % self._ui_phase)
+                    elif (not stalled) and self._hook_stalled:
+                        self._hook_stalled = False
+                        stalled_for = max(0.0, time.time() - getattr(self, "_stall_started", self._ui_heartbeat))
+                        log("看门狗：界面线程已恢复（刚才卡了约 %.1f 秒），鼠标钩子已装回" % stalled_for)
+                        self.invoke_on_pet(self.reinstall_wheel_hook)
+                    # WebView2 卡住时 PostWebMessageAsJson 会把调用线程钉死（不抛异常、也不返回）。
+                    # 这两条线索能区分"桌宠页面卡住"还是"设置页面卡住"：
+                    if self._flush_started and not self._flush_warned and (time.time() - self._flush_started) > 3.0:
+                        self._flush_warned = True
+                        log("看门狗：给桌宠页面发消息已卡住 %.1f 秒（桌宠的 WebView2 没响应）" % (time.time() - self._flush_started))
+                    if self._settings_posting and self._settings_post_started and not self._settings_post_warned and (time.time() - self._settings_post_started) > 3.0:
+                        self._settings_post_warned = True
+                        log("看门狗：给设置窗口发消息已卡住 %.1f 秒（设置窗口的 WebView2 没响应）" % (time.time() - self._settings_post_started))
+                except Exception as exc:  # noqa: BLE001
+                    log("鼠标钩子看门狗出错：%r" % (exc,))
+
+        threading.Thread(target=loop, name="hook-watchdog", daemon=True).start()
+
+    def reinstall_wheel_hook(self) -> None:
+        """界面线程恢复后把钩子装回去（必须在界面线程上装）。"""
+        try:
+            if not self._wheel_hook:
+                self.install_wheel_hook()
+                log("看门狗：界面线程已恢复，鼠标钩子已装回")
+        except Exception as exc:  # noqa: BLE001
+            log("重新安装鼠标钩子失败：%r" % (exc,))
 
     def drain_wheel(self) -> None:
         if not self.pending_wheel:
             return
+        picker = getattr(self, "agent_picker", None)
+        if picker is not None and not picker.IsDisposed:
+            self.pending_wheel = 0        # 快速切换面板开着：滚轮别顺带去缩桌宠
+            return
+        self.ui_phase("处理滚轮缩放")
         delta, self.pending_wheel = self.pending_wheel, 0
         # 只有光标在桌宠（角色像素）上才缩放
         cursor = wt.POINT()
         user32.GetCursorPos(ctypes.byref(cursor))
-        local_x = cursor.x - self.form.Left
-        local_y = cursor.y - self.form.Top
-        if not self.on_character(local_x, local_y):
+        if not self.wheel_on_pet((cursor.x, cursor.y)):
             return
         self.zoom_by((delta / 120.0) * 0.06)
 
@@ -1205,6 +1941,18 @@ class PetHost:
 
     # -- 拖动：独立线程 + SetWindowPos，不受 110ms 界面定时器限制 -----------------
 
+    def refresh_rect_cache(self) -> None:
+        """把 WinForms 窗口矩形缓存到普通 Python 元组，供低层鼠标钩子快速读取。"""
+        try:
+            self._rect_cache = (
+                self.form.Left,
+                self.form.Top,
+                self.form.Left + self.form.ClientSize.Width,
+                self.form.Top + self.form.ClientSize.Height,
+            )
+        except Exception:
+            pass
+
     def start_drag_loop(self) -> None:
         """拖动窗口：用一个 15ms 的 UI 定时器按光标位移搬运窗口。
 
@@ -1225,6 +1973,18 @@ class PetHost:
         self.drag_button = "left" if self.mouse.press_button == "left" else "right"
         self.drag_started_at = time.time()
         self.drag_moves = 0
+        # 拖动全程把鼠标捕获在这只窗口上。不捕获的话，按住、移动、松手这一串里
+        # 只要有一刻没有窗口接住，松手那下就会落到光标底下的窗口/图标上 ——
+        # 表现就是"拖桌宠的时候把下面的东西也点了"。
+        # 只在"这次按下确实压在角色像素上"时才抓：像素探测还没起来（比如网页还没
+        # 加载完）的时候判断本来就不可信，那时抓鼠标只会把用户的鼠标操作抢过来。
+        # 钩子已经把 DOWN/UP 成对吞掉，下层从未收到按下，不需要也不应该再抢系统捕获。
+        # 捕获只留给“钩子没接管”的兼容路径，避免把菜单/其他窗口的输入抢走。
+        if not self._left_swallowed and (self.alpha_probe_ok or self.form_input_works):
+            try:
+                user32.SetCapture(wt.HWND(self.form.Handle.ToInt64()))
+            except Exception as exc:  # noqa: BLE001
+                log("拖动前捕获鼠标失败：%r" % (exc,))
         log("开始拖动：锚点 %s（%s 键）" % (anchor, self.drag_button))
         self.drag_timer.Start()
 
@@ -1233,8 +1993,12 @@ class PetHost:
         if not anchor:
             self.drag_timer.Stop()
             return
-        vk = 0x01 if self.drag_button == "left" else 0x02
-        if not (user32.GetAsyncKeyState(vk) & 0x8000):
+        if self.drag_button == "left":
+            # 被钩子吞掉的左键不能看 GetAsyncKeyState；以钩子维护的逻辑状态为准。
+            held = self._left_swallowed or bool(user32.GetAsyncKeyState(0x01) & 0x8000)
+        else:
+            held = bool(user32.GetAsyncKeyState(0x02) & 0x8000)
+        if not held:
             self.finish_drag()
             return
         cursor = wt.POINT()
@@ -1242,6 +2006,7 @@ class PetHost:
         ax, ay, win_x, win_y = anchor
         try:
             self.form.Location = self.Point(int(win_x + cursor.x - ax), int(win_y + cursor.y - ay))
+            self.refresh_rect_cache()   # 拖完立刻按下时，钩子不能拿旧窗口矩形误判
             self.drag_moves += 1
         except Exception as exc:  # noqa: BLE001
             log("拖动失败：%r" % (exc,))
@@ -1249,6 +2014,11 @@ class PetHost:
 
     def finish_drag(self) -> None:
         self.drag_timer.Stop()
+        self._press_captured = False
+        try:
+            user32.ReleaseCapture()
+        except Exception as exc:  # noqa: BLE001
+            log("释放鼠标捕获失败：%r" % (exc,))
         anchor = self.drag_anchor
         self.drag_anchor = None
         if not anchor:
@@ -1325,6 +2095,14 @@ class PetHost:
 
     # -- 右键菜单（原生菜单，不受透明窗口影响） --------------------------------
 
+    def remember_card_open(self) -> None:
+        """把"进度卡片开着没"记进 pet_settings.json：重启后按上次的状态显示（2026-10-11 加）。"""
+        try:
+            self.settings["cardOpen"] = bool(self.inline_card_open)
+            settings_store.save(self.settings)
+        except Exception as exc:  # noqa: BLE001
+            log("保存进度卡片状态失败：%r" % (exc,))
+
     def toggle_card(self, show=None) -> None:
         """任务进度卡片。
 
@@ -1335,6 +2113,7 @@ class PetHost:
         if mode != "window":
             self.inline_card_open = (not self.inline_card_open) if show is None else bool(show)
             self.post({"t": "card", "open": self.inline_card_open})
+            self.remember_card_open()    # 记下来：下次启动还按这个状态显示
             log("进度卡片（窗口内渲染）：%s" % ("显示" if self.inline_card_open else "隐藏"))
             return
         if self.card is None or self.card.IsDisposed:
@@ -1343,6 +2122,30 @@ class PetHost:
             return
         target = (not self.card.Visible) if show is None else bool(show)
         self.invoke_on_card(lambda: self.show_card_window(target))
+
+    def refresh_card_now(self) -> None:
+        """右键菜单里的“刷新卡片信息”：立刻重读一次状态并推给卡片。
+
+        平时是 state_loop 每秒自己刷、内容没变就不重发；这个是“用户主动点一下，
+        就要马上看到最新”用的 —— 直接读一份推过去，不等那一秒，也不再做去重。
+        只刷新数据，不重新载入模型（那是“重新载入形象”的事）。
+        """
+        try:
+            import codex_state
+
+            payload = codex_state.snapshot()
+            payload["usage"] = usage_line(self)
+            self.last_payload = payload
+            if not self.inline_card_open:
+                # 卡片关着就先打开：不然点了“刷新”什么都没看见，会以为坏了
+                self.inline_card_open = True
+                self.post({"t": "card", "open": True})
+                self.remember_card_open()
+            self.post({"t": "state", "data": payload})
+            self.schedule_card_update(payload)
+            log("刷新卡片信息：%s / %s" % (payload.get("state"), payload.get("title") or "（无进行中的任务）"))
+        except Exception as exc:  # noqa: BLE001
+            log("刷新卡片信息失败：%r" % (exc,))
 
     def invoke_on_card(self, fn) -> None:
         """卡片窗口在它自己的线程上，跨线程操作必须回到那个线程。"""
@@ -1636,12 +2439,14 @@ class PetHost:
             menu = ContextMenuStrip()
             items = [
                 ("显示 / 隐藏任务进度", self.toggle_card),
+                ("刷新卡片信息", self.refresh_card_now),
                 ("摸头", lambda: self.post({"t": "react", "kind": "pat"})),
                 ("换个表情", lambda: self.post({"t": "cycle-expression"})),
                 ("随机动作", lambda: self.post({"t": "react", "kind": "motion"})),
                 ("-", None),
                 ("设置…", self.show_settings),
-                ("切到 Codex 窗口", self.focus_codex),
+                ("切到 Agent 窗口", self.focus_agent_window),
+                ("切换卡片 Agent", self.open_agent_picker),
                 ("重新载入形象", self.reload_page),
                 ("重画窗口（缩放后出现黑边时点一下）", self.repaint_now),
                 ("退出桌宠", lambda: self.form.Close()),
@@ -1653,16 +2458,63 @@ class PetHost:
                 item = ToolStripMenuItem(label)
                 item.Click += (lambda sender, args, h=handler: h())
                 menu.Items.Add(item)
+            menu.Closed += self.on_menu_closed
             self.menu = menu
+        try:
+            # 菜单文字跟着当前选中的 agent 走：切到 Hermes CLI 窗口 / 切到 Codex 窗口 …
+            label = "切到 %s 窗口" % self.agent_display_name()
+            for item in self.menu.Items:
+                item_text = str(getattr(item, "Text", "") or "")
+                if item_text.startswith("切到 ") and item_text.endswith("窗口"):
+                    item.Text = label
+        except Exception:  # noqa: BLE001
+            pass
         self.menu.Show(self.Point(screen_x, screen_y))
+        self._menu_shown_at = time.time()
+        self._menu_close_at = 0.0        # 新菜单：把上一次遗留的关闭请求作废
+        self._menu_visible = True
+        self._menu_rect = self.menu_screen_rect()
+        if self._menu_rect:
+            # 记下菜单真正落下的位置：点里面的「切换卡片 Agent」时，面板要顶在同一个地方
+            self._menu_pos = (self._menu_rect[0], self._menu_rect[1])
+        else:
+            self._menu_pos = (screen_x, screen_y)
         log("弹出右键菜单")
+
+    def on_menu_closed(self, sender, args) -> None:
+        self._menu_visible = False
+        self._menu_rect = None
+        self._menu_close_at = 0.0
+        # 关键：点菜单项会让菜单**立刻**关闭，等 33ms 后轮询再跑时菜单已经不可见了 ——
+        # 只靠 _menu_visible 挡不住，所以关菜单时统一开一小段忽略窗口，
+        # 把"点菜单的那一下"整段吃掉（含按下、松开），不让它落到下面的图标按钮上。
+        self._ignore_click_until = time.time() + 0.35
+        alive = time.time() - self._menu_shown_at if self._menu_shown_at else 0.0
+        if 0 < alive < 0.6:
+            # 刚弹出就被关掉：多半是"上一次的关闭请求"或者点外面漏进来了，记一笔方便排查
+            log("右键菜单刚弹出就关闭了（存活 %.2fs）" % alive)
+
+    def menu_screen_rect(self):
+        """菜单当前的屏幕矩形（菜单是顶层弹出窗口，Bounds 就是屏幕坐标）。"""
+        try:
+            if self.menu is None or self.menu.IsDisposed or not self.menu.Visible:
+                return None
+            bounds = self.menu.Bounds
+            return (bounds.Left, bounds.Top, bounds.Right, bounds.Bottom)
+        except Exception:  # noqa: BLE001
+            return None
 
     def on_cursor_tick(self, sender, args) -> None:
         """视线的输入就是鼠标位置：~30Hz 送一次，而且当场 flush 出去，不再等下一个 110ms 的 tick。
 
         （on_tick 也在调 stream_cursor，里面的最小间隔判断会挡住重复的那一次。）
         """
+        # 钩子吃掉的右键：菜单在这里弹（33ms 一次，比 110ms 的 tick 跟手）
+        if self._pending_menu_at:
+            menu_xy, self._pending_menu_at = self._pending_menu_at, None
+            self.show_menu(menu_xy[0], menu_xy[1])   # 每次右键都弹，连点也不漏
         self.stream_cursor(time.time())
+        self.handle_mouse()      # 鼠标判定也走 33ms：只靠 110ms 那个 tick 会慢一拍
         self.flush()
 
     def stream_cursor(self, now: float) -> None:
@@ -1671,7 +2523,9 @@ class PetHost:
             return
         cursor = wt.POINT()
         user32.GetCursorPos(ctypes.byref(cursor))
-        scale = self.dpi_scale or 1.0
+        # 用网页自己报的 dpr：画布和 CSS 的换算就是按它来的。
+        # 以前这里用的是窗口 DPI（dpi_scale），两者只要不一致，像素探测就会采样到偏掉的点。
+        scale = self.web_dpr or self.dpi_scale or 1.0
         local_x = (cursor.x - self.form.Left) / scale
         local_y = (cursor.y - self.form.Top) / scale
         inside = 0 <= local_x <= self.form.ClientSize.Width / scale and 0 <= local_y <= self.form.ClientSize.Height / scale
@@ -1689,6 +2543,7 @@ class PetHost:
         new_h = int(round(h * scale))
         if getattr(self, "Size", None) is None:
             return
+        self.ui_phase("调整窗口大小")
         old = self.form.ClientSize
         if abs(old.Width - new_w) < 3 and abs(old.Height - new_h) < 3:
             return
@@ -1870,7 +2725,7 @@ class PetHost:
             self.post({"t": "mute", "seconds": 300})
             self.post({"t": "say", "text": "动画已静音 5 分钟"})
         elif action == "codex-focus":
-            self.focus_codex()
+            self.focus_agent_window()       # 底部按钮那个动作：跟当前 agent 走
         elif action == "codex-new-session":
             if self.focus_codex():
                 self.send_key_chord("CTRL", "N")
@@ -1901,8 +2756,9 @@ class PetHost:
                 user32.PostMessageW(wt.HWND(hwnd), 0x0010, 0, 0)
 
     def confirm_action(self, action_label: str, button_label: str) -> bool:
-        from System.Drawing import Size
+        from System.Drawing import Font, Size
         from System.Windows.Forms import (
+            AutoScaleMode,
             Button,
             DialogResult,
             Form,
@@ -1911,9 +2767,17 @@ class PetHost:
             Label,
         )
 
+        # 原来的 430x155 + 默认 9pt 字太小（高 DPI 屏上尤其糊）。
+        # 这里按窗口 DPI 放大布局，字号提到 12pt（pt 会随 DPI 自动放大），
+        # AutoScaleMode 设成 None —— 尺寸已经按 DPI 给足，别再被自动缩放叠一次。
+        scale = float(getattr(self, "dpi_scale", 1.0) or 1.0)
+
+        def px(value: float) -> int:
+            return int(round(value * scale))
+
         form = Form()
         form.Text = "确认底部按钮操作"
-        form.ClientSize = Size(430, 155)
+        form.ClientSize = Size(px(620), px(250))
         form.StartPosition = FormStartPosition.CenterScreen
         form.TopMost = True
         form.FormBorderStyle = FormBorderStyle.FixedDialog
@@ -1921,18 +2785,24 @@ class PetHost:
         form.MinimizeBox = False
         form.ControlBox = False
         form.ShowInTaskbar = False
+        form.AutoScaleMode = getattr(AutoScaleMode, "None")
+
+        ui_font = Font("Microsoft YaHei UI", 16.0)      # 想再大/再小就改这一个数字
 
         label = Label()
+        label.Font = ui_font
         label.Text = "确定要执行“%s”吗？\n\n按钮：%s" % (action_label, button_label)
-        label.SetBounds(16, 14, 398, 58)
+        label.SetBounds(px(34), px(24), px(552), px(120))
         confirm = Button()
+        confirm.Font = ui_font
         confirm.Text = "确认"
         confirm.DialogResult = DialogResult.OK
-        confirm.SetBounds(226, 96, 88, 32)
+        confirm.SetBounds(px(300), px(184), px(140), px(48))
         cancel = Button()
+        cancel.Font = ui_font
         cancel.Text = "取消"
         cancel.DialogResult = DialogResult.Cancel
-        cancel.SetBounds(326, 96, 88, 32)
+        cancel.SetBounds(px(456), px(184), px(140), px(48))
         form.Controls.AddRange([label, confirm, cancel])
         form.AcceptButton = confirm
         form.CancelButton = cancel
@@ -1948,8 +2818,9 @@ class PetHost:
             form.Dispose()
 
     def prompt_text(self, title: str, prompt: str) -> str:
-        from System.Drawing import Size
+        from System.Drawing import Font, Size
         from System.Windows.Forms import (
+            AutoScaleMode,
             Button,
             DialogResult,
             Form,
@@ -1959,9 +2830,15 @@ class PetHost:
             TextBox,
         )
 
+        # 跟"确认底部按钮操作"同一套放大规则：按 DPI 放大布局 + 12pt 字号
+        scale = float(getattr(self, "dpi_scale", 1.0) or 1.0)
+
+        def px(value: float) -> int:
+            return int(round(value * scale))
+
         form = Form()
         form.Text = title
-        form.ClientSize = Size(420, 150)
+        form.ClientSize = Size(px(620), px(258))
         form.StartPosition = FormStartPosition.CenterScreen
         form.TopMost = True
         form.FormBorderStyle = FormBorderStyle.FixedDialog
@@ -1969,20 +2846,27 @@ class PetHost:
         form.MinimizeBox = False
         form.ControlBox = False
         form.ShowInTaskbar = False
+        form.AutoScaleMode = getattr(AutoScaleMode, "None")
+
+        ui_font = Font("Microsoft YaHei UI", 16.0)
 
         label = Label()
+        label.Font = ui_font
         label.Text = prompt
-        label.SetBounds(14, 12, 390, 24)
+        label.SetBounds(px(34), px(24), px(552), px(44))
         box = TextBox()
-        box.SetBounds(14, 42, 390, 28)
+        box.Font = ui_font
+        box.SetBounds(px(34), px(76), px(552), px(52))
         ok = Button()
+        ok.Font = ui_font
         ok.Text = "确定"
         ok.DialogResult = DialogResult.OK
-        ok.SetBounds(228, 92, 82, 30)
+        ok.SetBounds(px(300), px(192), px(140), px(48))
         cancel = Button()
+        cancel.Font = ui_font
         cancel.Text = "取消"
         cancel.DialogResult = DialogResult.Cancel
-        cancel.SetBounds(322, 92, 82, 30)
+        cancel.SetBounds(px(456), px(192), px(140), px(48))
         form.Controls.AddRange([label, box, ok, cancel])
         form.AcceptButton = ok
         form.CancelButton = cancel
@@ -2034,7 +2918,7 @@ class PetHost:
 
                 tray = NotifyIcon()
                 tray.Icon = Icon(os.path.join(WEB, "icon.ico"))
-                tray.Text = "Codex 桌宠"
+                tray.Text = "Agent 桌宠"
                 menu = ContextMenuStrip()
                 show_item = ToolStripMenuItem("显示桌宠")
                 quit_item = ToolStripMenuItem("退出桌宠")
@@ -2105,6 +2989,12 @@ class PetHost:
             return 0
         found.sort(key=lambda item: -item[0])
         _, hwnd, title, image = found[0]
+        self._activate_window(hwnd)
+        log("已切到 Codex 窗口：%s (%s)" % (title, os.path.basename(image)))
+        return int(hwnd)
+
+    def _activate_window(self, hwnd) -> None:
+        """把某个顶层窗口置前（含最小化恢复 + AttachThreadInput 兜底）。"""
         user32.ShowWindow(wt.HWND(hwnd), 9)  # SW_RESTORE
         user32.SetForegroundWindow(wt.HWND(hwnd))
         if int(user32.GetForegroundWindow() or 0) != int(hwnd):
@@ -2118,7 +3008,429 @@ class PetHost:
             if foreground:
                 user32.AttachThreadInput(user32.GetWindowThreadProcessId(foreground, None), current_thread, False)
             user32.AttachThreadInput(target_thread, current_thread, False)
-        log("已切到 Codex 窗口：%s (%s)" % (title, os.path.basename(image)))
+
+    def agent_display_name(self) -> str:
+        """当前接入的 agent 的名字（拿不到就退回 id）。"""
+        agent = str((self.settings or {}).get("agent") or "codex")
+        try:
+            import agent_state
+
+            for item in agent_state.agent_list():
+                if item.get("id") == agent:
+                    return str(item.get("name") or agent)
+        except Exception:  # noqa: BLE001
+            pass
+        return agent
+
+    def build_agent_picker(self):
+        """搭一个「切换卡片 Agent」快速选择面板（样式对齐设置页的 Agent 格）。
+
+        返回还没显示的 Form，位置和 Show 由 open_agent_picker() 负责。
+        为什么不用右键菜单的子菜单：① WinForms 的子菜单**悬停就自动展开**；
+        ② 桌宠的鼠标钩子把"点在子菜单里"当成"点在菜单外面"——子菜单是单独的弹出层，
+        不在主菜单矩形里，那一下点击会被拿去关菜单（ReleaseCapture + WM_PET_CLOSE_MENU），
+        子菜单项的 Click 永远不触发（实测"点了没反应"就是这么来的）。独立面板没这两个毛病。
+        """
+        from System.Drawing import Color, ContentAlignment, Font, Rectangle, Region, Size
+        from System.Drawing.Drawing2D import GraphicsPath
+        from System.Windows.Forms import (
+            Button,
+            Cursors,
+            FlatStyle,
+            Form,
+            FormBorderStyle,
+            FormStartPosition,
+            Label,
+            Padding,
+        )
+
+        try:
+            import agent_state
+
+            entries = [item for item in agent_state.agent_list() if item.get("id")]
+        except Exception as exc:  # noqa: BLE001
+            log("读取 agent 列表失败（快速切换面板）：%r" % (exc,))
+            entries = []
+        if not entries:
+            log("agent 列表为空，快速切换面板不弹")
+            return None
+
+        scale = float(self.dpi_scale or 1.0)
+
+        def px(value: float) -> int:
+            return int(round(value * scale))
+
+        # 颜色抄的设置页（web/settings.css）：卡片底 / 边线 / 文字 / 选中态 / 按钮
+        card = Color.FromArgb(24, 29, 41)            # --card #181d29
+        edge = Color.FromArgb(45, 49, 60)            # rgba(255,255,255,.09) 叠在卡片底色上
+        ink = Color.FromArgb(238, 243, 255)          # --ink
+        muted = Color.FromArgb(152, 164, 187)        # --muted
+        cell_bg = Color.FromArgb(34, 36, 41)         # rgba(255,255,255,.04)
+        cell_hover_bg = Color.FromArgb(33, 44, 71)
+        cell_hover_edge = Color.FromArgb(67, 90, 148)
+        cell_on_bg = Color.FromArgb(38, 53, 95)      # rgba(70,110,220,.3)
+        cell_on_edge = Color.FromArgb(89, 120, 202)  # rgba(110,150,255,.75)
+        btn_bg = Color.FromArgb(35, 48, 84)          # .btn
+        btn_edge = Color.FromArgb(58, 77, 127)
+        btn_hover_bg = Color.FromArgb(42, 61, 113)
+        ghost_bg = Color.FromArgb(36, 40, 52)        # .btn.ghost
+        ghost_hover_bg = Color.FromArgb(46, 51, 66)
+
+        # 尺寸按"右键菜单旁边的小面板"来定：整体大约是设置页格子的 0.7 倍
+        gap_x, gap_y = 6.0, 4.0
+        cell_w, cell_h = 104.0, 26.0
+        pad, title_h, footer_h = 10.0, 18.0, 22.0
+        gap_title, gap_footer = 6.0, 7.0
+        columns = 2                                   # 和设置页一样：两列，先排满第一列
+        rows = max(1, int(math.ceil(len(entries) / float(columns))))
+        width = pad * 2 + columns * cell_w + (columns - 1) * gap_x
+        height = (
+            pad + title_h + gap_title
+            + rows * cell_h + (rows - 1) * gap_y
+            + gap_footer + footer_h + pad
+        )
+
+        current = str((self.settings or {}).get("agent") or "codex")
+        chosen = {"id": current}
+        cells = []
+
+        def mark_click() -> None:
+            # 面板可能压在角色上：点面板时别再让桌宠把那几下当"摸头/换表情"
+            self._ignore_click_until = time.time() + 0.35
+
+        def paint(btn, agent_id: str) -> None:
+            on = agent_id == chosen["id"]
+            btn.BackColor = cell_on_bg if on else cell_bg
+            btn.ForeColor = ink
+            btn.FlatAppearance.BorderColor = cell_on_edge if on else edge
+
+        def hover(btn, agent_id: str, entered: bool) -> None:
+            if agent_id == chosen["id"]:
+                return
+            if entered:
+                btn.BackColor = cell_hover_bg
+                btn.FlatAppearance.BorderColor = cell_hover_edge
+            else:
+                paint(btn, agent_id)
+
+        def choose(agent_id: str) -> None:
+            chosen["id"] = agent_id
+            mark_click()
+            for btn, aid in cells:
+                paint(btn, aid)
+
+        form = Form()
+        form.FormBorderStyle = getattr(FormBorderStyle, "None")
+        form.ShowInTaskbar = False
+        form.TopMost = True
+        form.StartPosition = FormStartPosition.Manual
+        form.BackColor = card
+        form.ClientSize = Size(px(width), px(height))
+        form.KeyPreview = True
+        form.Text = "切换卡片 Agent"
+        try:  # 圆角，和设置页的卡片一个手感
+            radius = px(8)
+            path = GraphicsPath()
+            box = Rectangle(0, 0, px(width) - 1, px(height) - 1)
+            path.AddArc(box.X, box.Y, radius, radius, 180, 90)
+            path.AddArc(box.Right - radius, box.Y, radius, radius, 270, 90)
+            path.AddArc(box.Right - radius, box.Bottom - radius, radius, radius, 0, 90)
+            path.AddArc(box.X, box.Bottom - radius, radius, radius, 90, 90)
+            path.CloseFigure()
+            form.Region = Region(path)
+        except Exception:  # noqa: BLE001
+            pass
+
+        font_title = Font("Microsoft YaHei UI", 9.5)
+        font_cell = Font("Microsoft YaHei UI", 8.0)
+
+        title = Label()
+        title.Text = "切换卡片 Agent"
+        title.ForeColor = ink
+        title.Font = font_title
+        title.TextAlign = ContentAlignment.MiddleLeft
+        title.SetBounds(px(pad), px(pad), px(width - pad * 2), px(title_h))
+        title.MouseDown += (lambda sender, args: mark_click())
+        form.Controls.Add(title)
+
+        for index, item_info in enumerate(entries):
+            agent_id = str(item_info.get("id") or "")
+            col, row = index // rows, index % rows
+            btn = Button()
+            btn.Text = str(item_info.get("name") or agent_id)
+            btn.FlatStyle = FlatStyle.Flat
+            btn.FlatAppearance.BorderSize = 1
+            btn.TextAlign = ContentAlignment.MiddleLeft
+            btn.Padding = Padding(px(6), 0, 0, 0)
+            btn.Font = font_cell
+            btn.AutoEllipsis = True
+            btn.UseVisualStyleBackColor = False
+            btn.Cursor = Cursors.Hand
+            btn.SetBounds(
+                px(pad + col * (cell_w + gap_x)),
+                px(pad + title_h + gap_title + row * (cell_h + gap_y)),
+                px(cell_w),
+                px(cell_h),
+            )
+            btn.Click += (lambda sender, args, aid=agent_id: choose(aid))
+            btn.MouseDown += (lambda sender, args: mark_click())
+            btn.MouseEnter += (lambda sender, args, b=btn, aid=agent_id: hover(b, aid, True))
+            btn.MouseLeave += (lambda sender, args, b=btn, aid=agent_id: hover(b, aid, False))
+            paint(btn, agent_id)
+            form.Controls.Add(btn)
+            cells.append((btn, agent_id))
+
+        def confirm_click(sender=None, args=None) -> None:
+            mark_click()
+            agent_id = chosen["id"]
+            self.close_agent_picker()
+            self.switch_agent(agent_id)
+
+        def cancel_click(sender=None, args=None) -> None:
+            self.close_agent_picker()
+
+        btn_w = 58.0
+        confirm = Button()
+        confirm.Text = "确认"
+        confirm.FlatStyle = FlatStyle.Flat
+        confirm.FlatAppearance.BorderSize = 1
+        confirm.FlatAppearance.BorderColor = btn_edge
+        confirm.BackColor = btn_bg
+        confirm.ForeColor = Color.FromArgb(234, 241, 255)
+        confirm.Font = font_cell
+        confirm.UseVisualStyleBackColor = False
+        confirm.Cursor = Cursors.Hand
+        confirm.SetBounds(px(width - pad - btn_w), px(height - pad - footer_h), px(btn_w), px(footer_h))
+        confirm.MouseDown += (lambda sender, args: mark_click())
+        confirm.MouseEnter += (lambda sender, args: setattr(confirm, "BackColor", btn_hover_bg))
+        confirm.MouseLeave += (lambda sender, args: setattr(confirm, "BackColor", btn_bg))
+        confirm.Click += confirm_click
+
+        cancel = Button()
+        cancel.Text = "取消"
+        cancel.FlatStyle = FlatStyle.Flat
+        cancel.FlatAppearance.BorderSize = 1
+        cancel.FlatAppearance.BorderColor = edge
+        cancel.BackColor = ghost_bg
+        cancel.ForeColor = muted
+        cancel.Font = font_cell
+        cancel.UseVisualStyleBackColor = False
+        cancel.Cursor = Cursors.Hand
+        cancel.SetBounds(px(width - pad - btn_w * 2 - 6), px(height - pad - footer_h), px(btn_w), px(footer_h))
+        cancel.MouseDown += (lambda sender, args: mark_click())
+        cancel.MouseEnter += (lambda sender, args: setattr(cancel, "BackColor", ghost_hover_bg))
+        cancel.MouseLeave += (lambda sender, args: setattr(cancel, "BackColor", ghost_bg))
+        cancel.Click += cancel_click
+
+        form.Controls.Add(confirm)
+        form.Controls.Add(cancel)
+        shown_at = {"t": time.time()}
+
+        def on_key(sender, args) -> None:
+            from System.Windows.Forms import Keys
+
+            if args.KeyCode == Keys.Escape:
+                cancel_click()
+
+        def on_deactivate(sender, args) -> None:
+            # 刚弹出来的一瞬可能先收到一次 Deactivate（焦点还在菜单那边），别把它当"点了外面"
+            if time.time() - shown_at["t"] < 0.35:
+                return
+            cancel_click()
+
+        form.KeyDown += on_key
+        form.Deactivate += on_deactivate
+        form.MouseDown += (lambda sender, args: mark_click())
+        return form
+
+    def open_agent_picker(self) -> None:
+        """右键菜单「切换卡片 Agent」：弹出快速选择面板。
+
+        点格子 = 选中（变色），底下「确认」才真正切换 —— 写的是和设置页同一个键
+        （pet_settings.json 的 agent）；点面板外面 / 按 Esc / 点「取消」= 不改设置。
+        位置：顶在右键总菜单刚才弹的地方（菜单一消失、面板就上来），贴屏幕边时夹回
+        工作区保证整块可见（见 agent_picker_location）。
+        """
+        self.close_agent_picker()
+        try:
+            form = self.build_agent_picker()
+        except Exception as exc:  # noqa: BLE001
+            log("快速切换面板创建失败：%r" % (exc,))
+            return
+        if form is None:
+            return
+        try:
+            from System.Drawing import Point as DrawingPoint
+            from System.Windows.Forms import Screen
+
+            pos = getattr(self, "_menu_pos", None)
+            if not pos:
+                # 没见过菜单就退回桌宠左上角（正常路径不会走到这）
+                pos = (self.form.Left, self.form.Top)
+            area = Screen.FromPoint(DrawingPoint(int(pos[0]), int(pos[1]))).WorkingArea
+            x, y = self.agent_picker_location(area, form.ClientSize, pos)
+            form.Location = DrawingPoint(x, y)
+        except Exception as exc:  # noqa: BLE001
+            log("快速切换面板定位失败（用默认位置）：%r" % (exc,))
+        self.agent_picker = form
+        form.FormClosed += (lambda sender, args: self.on_agent_picker_closed(form))
+        form.Show()
+        form.Activate()
+        log("弹出 Agent 快速切换面板（当前 %s）" % self.agent_display_name())
+
+    @staticmethod
+    def agent_picker_location(area, size, menu_pos):
+        """快速切换面板的落点：和右键总菜单同一个地方（左上角对齐），整块保证可见。
+
+        menu_pos 是弹菜单时记下的屏幕坐标（self._menu_pos）。贴屏幕右边/底部时，
+        面板比菜单大概，会被夹回工作区里 —— 看起来就是"顺边挪一点，不缺角"。
+        """
+        x = max(area.Left + 4, min(int(menu_pos[0]), area.Right - size.Width - 4))
+        y = max(area.Top + 4, min(int(menu_pos[1]), area.Bottom - size.Height - 4))
+        return x, y
+
+    def close_agent_picker(self) -> None:
+        form = getattr(self, "agent_picker", None)
+        if form is None:
+            return
+        self.agent_picker = None       # 先清引用：Close() 会触发 FormClosed
+        try:
+            if not form.IsDisposed:
+                form.Close()
+        except Exception as exc:  # noqa: BLE001
+            log("关闭快速切换面板失败：%r" % (exc,))
+
+    def on_agent_picker_closed(self, form) -> None:
+        if getattr(self, "agent_picker", None) is form:
+            self.agent_picker = None
+
+    def switch_agent(self, agent_id: str) -> None:
+        """右键菜单里的快速切换：换掉设置里接入的 agent。
+
+        写的是和设置页同一个键（pet_settings.json 的 agent）：状态循环下一秒按新 agent
+        读记录，卡片 / 表情 / 「切到 X 窗口」的菜单文字都会跟着换。
+        """
+        agent_id = str(agent_id or "").strip()
+        if not agent_id:
+            return
+        current = str((self.settings or {}).get("agent") or "codex")
+        if agent_id == current:
+            log("接入的 Agent 没变：%s" % agent_id)
+            return
+        self.settings["agent"] = agent_id
+        try:
+            self.settings = settings_store.save(self.settings)
+        except Exception as exc:  # noqa: BLE001
+            log("保存接入的 Agent 失败：%r" % (exc,))
+        log("接入的 Agent 已切换：%s（右键菜单快速设置）" % self.agent_display_name())
+        try:
+            self.push_settings()          # 同步给设置窗口（开着的话，选中项也会跟着变）
+        except Exception as exc:  # noqa: BLE001
+            log("推送接入的 Agent 设置失败：%r" % (exc,))
+        self.refresh_card_after_switch()  # 按了"确认"就立刻读一份新状态，不等下一秒
+
+    def refresh_card_after_switch(self) -> None:
+        """切换 agent 后马上重读一次状态推给卡片（读记录可能扫文件，放后台线程）。"""
+
+        def work() -> None:
+            try:
+                import agent_state
+
+                agent_id = str((self.settings or {}).get("agent") or "codex")
+                payload = agent_state.snapshot(agent_id)
+                payload["usage"] = usage_line(self)
+            except Exception as exc:  # noqa: BLE001
+                log("切换后立即刷新卡片失败：%r" % (exc,))
+                return
+            self.last_payload = payload
+            try:
+                self.post({"t": "state", "data": payload})
+                self.schedule_card_update(payload)
+            except Exception as exc:  # noqa: BLE001
+                log("切换后推送卡片失败：%r" % (exc,))
+
+        threading.Thread(target=work, name="agent-switch-refresh", daemon=True).start()
+
+    def focus_agent_window(self) -> int:
+        """切到"设置里选的那个 agent"的窗口。
+
+        Codex 走原来的 focus_codex()（桌面版是 ChatGPT.exe，按进程镜像认最准）；
+        其它 agent 两步走：
+          1. 原生 exe（claude / hermes 这类）→ 找到它的进程，再认"谁拥有承载它的窗口"；
+          2. 标题关键词（gemini / openclaw 这类 node 系 CLI 跑在终端里，窗口属于终端进程）。
+        终端宿主（Windows Terminal / conhost / PowerShell / cmd）加一点分，避免认错窗口。
+        """
+        agent = str((self.settings or {}).get("agent") or "codex")
+        if agent == "codex":
+            return self.focus_codex()
+        rules = AGENT_WINDOW_RULES.get(agent)
+        if not rules:
+            return self.focus_codex()
+
+        try:
+            import agent_state
+        except Exception:  # noqa: BLE001
+            agent_state = None
+
+        tree: set[int] = set()
+        if agent_state is not None:
+            try:
+                for pid in agent_state.find_process_pids(rules.get("procs") or []):
+                    tree.update(agent_state.ancestor_pids(pid, 8))
+            except Exception as exc:  # noqa: BLE001
+                log("查 %s 进程树失败（不影响找窗口）：%r" % (agent, exc))
+
+        me = int(self.form.Handle.ToInt64())
+        titles = tuple(str(item).lower() for item in (rules.get("titles") or ()))
+        hosts = ("windowsterminal", "openconsole", "conhost", "powershell", "pwsh", "cmd",
+                 "wezterm", "alacritty", "mintty")
+        found = []
+        terminals = []          # 终端类窗口（找不到目标时写进日志，方便补规则）
+
+        @ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+        def visit(hwnd, _):
+            if int(hwnd) == me or not user32.IsWindowVisible(hwnd):
+                return True
+            length = user32.GetWindowTextLengthW(hwnd)
+            if length <= 0:
+                return True
+            buf = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(hwnd, buf, length + 1)
+            title = buf.value
+            title_l = title.lower()
+            image = self.process_image(hwnd).lower()
+            base = os.path.basename(image)
+            score = 0
+            if titles and any(key in title_l for key in titles):
+                score += 5
+            if tree and agent_state is not None:
+                pid = ctypes.c_ulong(0)
+                user32.GetWindowThreadProcessId(wt.HWND(hwnd), ctypes.byref(pid))
+                try:
+                    if set(agent_state.ancestor_pids(int(pid.value), 8)) & tree:
+                        score += 4
+                except Exception:  # noqa: BLE001
+                    pass
+            if base and any(host in base for host in hosts):
+                score += 2
+                terminals.append("%s [%s]" % (title, base))
+            if "桌宠" in title or "codexpet" in title_l:
+                score -= 6            # 别切到我们自己
+            if agent != "codex" and "codex" in title_l:
+                score -= 3            # Codex 的窗口别抢
+            if score > 0:
+                found.append((score, hwnd, title, image))
+            return True
+
+        user32.EnumWindows(visit, 0)
+        if not found:
+            hint = "；现在开着的终端窗口：%s" % " | ".join(terminals[:6]) if terminals else ""
+            log("没找到 %s 的窗口（可能没在运行或在别的虚拟桌面）%s，可以自己切过去" % (agent, hint))
+            return 0
+        found.sort(key=lambda item: -item[0])
+        _, hwnd, title, image = found[0]
+        self._activate_window(hwnd)
+        log("已切到 %s 的窗口：%s (%s)" % (agent, title, os.path.basename(image)))
         return int(hwnd)
 
     def process_image(self, hwnd) -> str:
@@ -2243,15 +3555,49 @@ class PetHost:
         之前是在右键菜单的回调里直接建窗口，那条路径上线程公寓被当成 MTA，
         WebView2 会报 `RPC_E_CHANGED_MODE：无法在设置线程模式后对其加以更改`。
         每个窗口起一个自己的 STA 线程（并在里面自己 CoInitializeEx）就彻底绕开了。
+
+        "已经开着"的分支：最小化到任务栏 / 被别的窗口压住 / 被切到别的虚拟桌面时，
+        再点一次「设置…」都要把它叫回眼前 —— 光 Activate() 对最小化的窗口没用。
         """
-        if self.settings_window is not None and not self.settings_window.IsDisposed:
-            try:
-                self.settings_window.Activate()
-                self.settings_window.BringToFront()
-            except Exception:
-                pass
+        form = self.settings_window
+        if form is not None and not form.IsDisposed:
+            self.restore_settings_window(form)
             return
         self.spawn_window_thread("settings-window", self.build_settings_window)
+
+    def restore_settings_window(self, form) -> None:
+        """把已经开着的设置窗口叫回眼前（动作丢回设置窗口自己的 STA 线程上做）。
+
+        最小化的窗口只会响应"把 WindowState 设回 Normal"，Activate/BringToFront 对它
+        是无效的 —— 这就是之前"最小化后点设置没反应"的原因。
+        """
+
+        def do() -> None:
+            try:
+                from System.Windows.Forms import FormWindowState
+
+                was_min = form.WindowState == FormWindowState.Minimized
+                if was_min:
+                    form.WindowState = FormWindowState.Normal
+                if not form.Visible:
+                    form.Show()
+                # 可能被切到别的虚拟桌面去了：搬回桌宠现在所在的桌面（和首次打开同一套逻辑）
+                desktops = self.desktops or VirtualDesktops()
+                pet_form = getattr(self, "form", None)
+                if pet_form is not None:
+                    desktops.align_to(int(form.Handle.ToInt64()), int(pet_form.Handle.ToInt64()))
+                form.Activate()
+                form.BringToFront()
+                log("设置窗口叫回桌面（%s）" % ("从最小化还原" if was_min else "置前"))
+            except Exception as exc:  # noqa: BLE001
+                log("设置窗口置前失败：%r" % (exc,))
+
+        try:
+            from System import Action
+
+            form.BeginInvoke(Action(do))
+        except Exception:  # noqa: BLE001
+            do()
 
     def spawn_window_thread(self, name: str, build) -> None:
         def run() -> None:
@@ -2273,15 +3619,30 @@ class PetHost:
         threading.Thread(target=run, name=name, daemon=True).start()
 
     def build_settings_window(self):
-        from System.Drawing import Size
-        from System.Windows.Forms import DockStyle, Form, FormStartPosition
+        from System.Drawing import Point as DrawingPoint, Rectangle, Size
+        from System.Windows.Forms import (
+            DockStyle,
+            Form,
+            FormStartPosition,
+            FormWindowState,
+            Screen,
+        )
         from Microsoft.Web.WebView2.WinForms import CoreWebView2CreationProperties, WebView2
 
         form = Form()
-        form.Text = "Codex 桌宠 · 设置"
+        form.Text = "Agent 桌宠 · 设置"
         form.ClientSize = Size(580, 680)
         form.StartPosition = FormStartPosition.CenterScreen
         form.MinimumSize = Size(520, 520)
+        # 记住上次摆好的大小/位置：关掉再开不该回到"初始样子"（2026-10-11 加）。
+        # 存的坐标跑到屏幕外（换了显示器/改了分辨率）时夹回工作区，保证整块可见。
+        saved_rect = load_settings_window_rect()
+        if saved_rect:
+            sx, sy, sw, sh = saved_rect
+            work = Screen.FromPoint(DrawingPoint(sx, sy)).WorkingArea
+            bx, by, bw, bh = fit_window_rect(work, sx, sy, sw, sh)
+            form.StartPosition = FormStartPosition.Manual
+            form.Bounds = Rectangle(bx, by, bw, bh)
         form.TopMost = True          # 先置顶，避免被 Codex/浏览器窗口压在下面
         form.ShowInTaskbar = True    # 也在任务栏留一个，找不到时能点出来
         try:
@@ -2299,6 +3660,21 @@ class PetHost:
 
         self.settings_window = form
         self.settings_webview = webview
+        self.register_aux_window(form)
+
+        def remember_geometry(sender=None, args=None) -> None:
+            """用户摆好的大小/位置存起来（最小化/最大化时看 RestoreBounds，那是还原后的样子）。"""
+            try:
+                if form.WindowState == FormWindowState.Normal:
+                    bounds = form.Bounds
+                else:
+                    bounds = form.RestoreBounds
+                save_settings_window_rect(bounds.X, bounds.Y, bounds.Width, bounds.Height)
+            except Exception as exc:  # noqa: BLE001
+                log("保存设置窗口大小失败：%r" % (exc,))
+
+        form.ResizeEnd += remember_geometry
+        form.FormClosing += remember_geometry
         form.FormClosed += self.on_settings_closed
         form.Show()
         form.Activate()
@@ -2309,10 +3685,14 @@ class PetHost:
         pet_form = getattr(self, "form", None)
         if pet_form is not None:
             desktops.align_to(int(form.Handle.ToInt64()), int(pet_form.Handle.ToInt64()))
+        # 同步虚拟桌面后再次明确置顶：设置窗口始终盖在桌宠上面，桌宠仍可透过其外区域操作。
+        form.TopMost = True
+        form.BringToFront()
         log("打开设置窗口（置顶已开启；虚拟桌面已同步）")
         return form
 
     def on_settings_closed(self, sender, args) -> None:
+        self.unregister_aux_window(sender)
         self.settings_window = None
 
     def on_settings_ready(self, sender, args) -> None:
@@ -2337,8 +3717,12 @@ class PetHost:
             self.apply_settings(msg.get("data") or {})
         elif kind == "action":
             self.run_action(msg.get("name") or "")
+        elif kind == "perf":
+            data = msg.get("data") or {}
+            if data.get("renderMs"):
+                log("设置页渲染耗时 %s 毫秒（只有超过 300ms 才会上报）" % data.get("renderMs"))
 
-    def push_settings(self) -> None:
+    def push_settings(self, force: bool = True) -> None:
         payload = dict(self.settings)
         payload["expressions"] = dict(self.settings.get("expressions") or {})
         low, high = self.scale_limits()
@@ -2349,6 +3733,9 @@ class PetHost:
         payload["motions"] = self.motion_inventory()
         payload["baseSize"] = [WINDOW_W, WINDOW_H]
         payload["petNow"] = dict(self.status or {})   # 桌宠此刻在演什么，设置里能看到
+        payload["cacheText"] = self.cache_size_text()  # 排查栏：WebView2 缓存占用
+        payload["cacheBytes"] = self.cache_size_bytes()
+        payload["desktopLink"] = desktop_link_exists()  # 排查栏：桌面快捷方式状态
         payload["renderFps"] = round(self.render_fps, 1)   # 给"渲染帧率上限"旁边显示当前帧率
         payload["allowed"] = {
             "motions": self.allowed_motion_count(),
@@ -2359,33 +3746,292 @@ class PetHost:
         payload["logPath"] = log_path
         payload["home"] = HERE
         payload["autostart"] = os.path.exists(startup_link_path())
-        payload["followCodex"] = codex_follow_enabled()
+        # 注意：这个函数会被界面线程直接调用（滚动缩放、页面就绪…），
+        # 所以**只能读缓存**，不能在这里同步跑 tasklist / PowerShell。
+        try:
+            import agent_state
+
+            payload["agentList"] = agent_state.agent_list()
+            payload["agentStatus"] = dict(self.agent_status_cache)
+        except Exception as exc:  # noqa: BLE001
+            log("读取 agent 列表失败：%r" % (exc,))
+            payload["agentList"] = []
+            payload["agentStatus"] = {}
+        self.refresh_agent_status_async()
+        self.refresh_cache_size_async()
+        payload["fpsLimit"] = self.effective_fps_limit()   # 卡顿保护期内会临时压低
         message = {"t": "settings", "data": payload}
+        # 内容没变就别再投一次：WebView2 忙的时候投递会把调用线程钉住，
+        # 少发一次少一次风险（renderFps / petNow 是小字，允许最多 10 秒不刷新）。
+        stable = dict(payload)
+        stable.pop("renderFps", None)
+        stable.pop("petNow", None)
+        signature = json.dumps(stable, ensure_ascii=False, sort_keys=True, default=str)
+        now = time.time()
+        if not force and signature == self._settings_signature and (now - self._settings_pushed_at) < 10.0:
+            return
+        self._settings_signature = signature
+        self._settings_pushed_at = now
         self.post(message)
         self.send_to_settings_window(message)
 
+    def effective_fps_limit(self) -> float:
+        """渲染帧率上限的"生效值"：卡顿保护期内压到 60。"""
+        try:
+            limit = float(self.settings.get("fpsLimit", 60) or 0)
+        except (TypeError, ValueError):
+            limit = 60.0
+        if time.time() < self._fps_protect_until and (limit <= 0 or limit > 60):
+            return 60.0
+        return limit
+
+    def protect_fps(self, reason: str) -> None:
+        """检测到卡顿 → 临时把渲染帧率压到 60（默认 3 分钟，期间再卡就续期）。
+
+        桌宠是 113fps 的大 Live2D 窗口 + 两个 WebView2；显卡/合成器一忙，
+        窗口操作和消息投递都会被拖住（上一轮"未响应"的线程栈就是这么来的）。
+        先把渲染压力降下来，桌面就不容易被拖卡；3 分钟后自动恢复原帧率。
+        """
+        now = time.time()
+        if now < self._fps_protect_until:
+            self._fps_protect_until = now + 180.0     # 还在保护期内又卡了：续期
+            return
+        self._fps_protect_until = now + 180.0
+        log("检测到卡顿（%s）：临时把渲染帧率压到 60，3 分钟后自动恢复" % reason)
+        try:
+            self.push_settings()                      # 让页面立刻按新上限渲染
+        except Exception as exc:  # noqa: BLE001
+            log("压低渲染帧率失败：%r" % (exc,))
+
+    def refresh_agent_status_async(self, force: bool = False) -> None:
+        """后台线程去检测各 agent 的本地记录（tasklist / PowerShell 都很慢，绝不能挡界面）。
+
+        结果放进 self.agent_status_cache，回来后再 push 一次；15 秒内最多算一轮。
+        """
+        now = time.time()
+        if self.agent_status_busy:
+            return
+        if not force and (now - self.agent_status_at) < 15.0:
+            return
+        self.agent_status_busy = True
+
+        def work() -> None:
+            try:
+                import agent_state
+
+                status = agent_state.detect_all()
+            except Exception as exc:  # noqa: BLE001
+                log("检测 agent 本地记录失败：%r" % (exc,))
+                status = None
+            if status is not None:
+                self.agent_status_cache = status
+            self.agent_status_at = time.time()
+            self.agent_status_busy = False
+            try:
+                self.push_settings(force=False)      # 定时刷新：内容没变就别再投递
+            except Exception as exc:  # noqa: BLE001
+                log("推送 agent 检测结果失败：%r" % (exc,))
+
+        threading.Thread(target=work, name="agent-status", daemon=True).start()
+
+    # -- WebView2 缓存（设置页排查栏） --------------------------------------
+
+    def cache_size_bytes(self) -> int:
+        return int(getattr(self, "_cache_size_bytes", 0) or 0)
+
+    def cache_size_text(self) -> str:
+        if not getattr(self, "_cache_size_ready", False):
+            return "计算中…"
+        mb = self.cache_size_bytes() / (1024.0 * 1024.0)
+        if mb >= 1024.0:
+            return "%.2f GB" % (mb / 1024.0)
+        return "%.1f MB" % mb
+
+    def refresh_cache_size_async(self, force: bool = False) -> None:
+        """后台量 .webview2 的体积：好几万个小文件，绝不能在界面线程里爬目录。"""
+        now = time.time()
+        if getattr(self, "_cache_size_busy", False):
+            return
+        if not force and (now - getattr(self, "_cache_size_at", 0.0)) < 60.0:
+            return
+        self._cache_size_busy = True
+
+        def work() -> None:
+            total = 0
+            root = os.path.join(HERE, ".webview2")
+            try:
+                for base, _dirs, files in os.walk(root):
+                    for name in files:
+                        try:
+                            total += os.path.getsize(os.path.join(base, name))
+                        except OSError:
+                            pass
+            except Exception as exc:      # noqa: BLE001
+                log("统计 WebView2 缓存失败：%r" % (exc,))
+                total = 0
+            self._cache_size_bytes = total
+            self._cache_size_ready = True
+            self._cache_size_at = time.time()
+            self._cache_size_busy = False
+            try:
+                self.push_settings(force=False)
+            except Exception:      # noqa: BLE001
+                pass
+
+        threading.Thread(target=work, name="cache-size", daemon=True).start()
+
+    def clear_webview_cache(self) -> None:
+        """清 WebView2 缓存：写请求文件，让 pet-launcher 在旧进程退出后删掉再重启。"""
+        flag = os.path.join(HERE, "clear-cache.request")
+        try:
+            with open(flag, "w", encoding="utf-8") as fh:
+                fh.write(str(os.getpid()))
+        except OSError as exc:
+            log("写清除缓存请求失败：%r" % (exc,))
+            return
+        log("收到清除 WebView2 缓存请求（当前约 %s），重启时清理" % self.cache_size_text(), force=True)
+        try:
+            import subprocess
+
+            creation = 0x08000000      # CREATE_NO_WINDOW
+            subprocess.Popen(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                 "-WindowStyle", "Hidden", "-File", os.path.join(HERE, "pet-launcher.ps1")],
+                cwd=HERE,
+                creationflags=creation,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception as exc:      # noqa: BLE001
+            log("拉起清缓存助手失败：%r" % (exc,))
+            return
+        from System import Action
+
+        self.form.BeginInvoke(Action(self.form.Close))
+
+    def create_desktop_link(self) -> bool:
+        """在桌面创建「Agent 桌宠」快捷方式（设置页按钮；属性和 launcher 首次创建一致）。"""
+        link = desktop_link_path()
+        icon = os.path.join(HERE, "web", "icon-transparent.ico")
+        if not os.path.exists(icon):
+            icon = os.path.join(HERE, "web", "icon.ico")
+        ps_exe = os.path.join(
+            os.environ.get("SystemRoot", r"C:\Windows"),
+            "System32", "WindowsPowerShell", "v1.0", "powershell.exe",
+        )
+        launcher = os.path.join(HERE, "pet-launcher.ps1")
+        ps = (
+            "$ws = New-Object -ComObject WScript.Shell; "
+            "$l = $ws.CreateShortcut('{dst}'); "
+            "$l.TargetPath = '{exe}'; "
+            "$l.Arguments = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"{launcher}\"'; "
+            "$l.WorkingDirectory = '{here}'; "
+            "$l.IconLocation = '{icon},0'; "
+            "$l.Description = 'Agent 桌宠：Live2D 形象跟着接入的 Agent 实时状态变化'; "
+            "$l.Save()"
+        ).format(dst=link, exe=ps_exe, launcher=launcher, here=HERE, icon=icon)
+        try:
+            import subprocess
+
+            subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
+                cwd=HERE,
+                creationflags=0x08000000,
+                timeout=25,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception as exc:      # noqa: BLE001
+            log("创建桌面快捷方式失败：%r" % (exc,))
+            self.push_settings()
+            return False
+        ok = os.path.exists(link)
+        if ok:
+            self._mark_desktop_link_done()
+            log("已创建桌面快捷方式：Agent 桌宠")
+        else:
+            log("创建桌面快捷方式失败（请查看日志）")
+        self.push_settings()
+        return ok
+
+    def remove_desktop_link(self) -> None:
+        """删掉桌面快捷方式，并保留 desktop-link.done：以后不会再自动重建。"""
+        link = desktop_link_path()
+        try:
+            if os.path.exists(link):
+                os.remove(link)
+        except OSError as exc:
+            log("删除桌面快捷方式失败：%r" % (exc,))
+        self._mark_desktop_link_done()
+        log("已删除桌面快捷方式（设置里可随时重建）")
+        self.push_settings()
+
+    def _mark_desktop_link_done(self) -> None:
+        try:
+            with open(os.path.join(HERE, "desktop-link.done"), "w", encoding="ascii") as fh:
+                fh.write(time.strftime("%Y-%m-%d %H:%M:%S"))
+        except OSError:
+            pass
+
     def send_to_settings_window(self, message: dict) -> None:
-        """设置窗口在别的线程上，跨线程碰 WebView2 必须回到它自己的线程（BeginInvoke）。"""
+        if time.time() < getattr(self, "_settings_push_muted_until", 0.0):
+            return          # 设置窗口的 WebView2 刚才很慢：先别投递，避免把它顶成"未响应"
+        """设置窗口在别的线程上，跨线程碰 WebView2 必须回到它自己的线程（BeginInvoke）。
+
+        WebView2 忙的时候 PostWebMessageAsJson 会**阻塞调用它的线程**——如果每条消息都直接发，
+        设置窗口的界面线程就会一阵一阵地卡（鼠标在窗口上就像"暂停"了）。所以这里做两件事：
+        1. 只留最新一条待发消息（消息是"全量状态"，旧的没必要发了）；
+        2. 同时只有一个发送在跑，发完再看有没有新消息。
+        """
         form = self.settings_window
         webview = self.settings_webview
         if form is None or webview is None or form.IsDisposed:
             return
+        self._settings_outbox = message
+        if getattr(self, "_settings_posting", False):
+            return
+        self._settings_posting = True
         try:
             from System import Action
 
-            payload = json.dumps(message, ensure_ascii=False)
+            def pump():
+                try:
+                    while True:
+                        current = self._settings_outbox
+                        if current is None:
+                            break
+                        self._settings_outbox = None
+                        core = webview.CoreWebView2
+                        if core is None:
+                            break
+                        started = time.time()
+                        self._settings_post_started = started
+                        self._settings_post_warned = False
+                        core.PostWebMessageAsJson(json.dumps(current, ensure_ascii=False))
+                        self._settings_post_started = 0.0
+                        spent = time.time() - started
+                        if spent > 0.3:
+                            log("发给设置窗口的消息耗时 %.1f 秒（WebView2 忙）" % spent)
+                        if spent > 1.0:
+                            self.protect_fps("给设置窗口发消息 %.1f 秒" % spent)
+                        if spent > 2.0:
+                            self._settings_push_muted_until = time.time() + 30.0
+                            log("设置窗口的 WebView2 很慢（%.1f 秒）：暂停给它推消息 30 秒，避免整窗未响应" % spent)
+                except Exception as exc:  # noqa: BLE001
+                    log("向设置窗口发送配置失败：%r" % (exc,))
+                finally:
+                    self._settings_posting = False
 
-            def do():
-                core = webview.CoreWebView2
-                if core is not None:
-                    core.PostWebMessageAsJson(payload)
-
-            form.BeginInvoke(Action(do))
+            form.BeginInvoke(Action(pump))
         except Exception as exc:  # noqa: BLE001
+            self._settings_posting = False
             log("向设置窗口发送配置失败：%r" % (exc,))
 
     def scale_limits(self) -> tuple[float, float]:
-        """最小约 48x48（桌面图标大小）；最大至少给到 SCALE_MAX_WISH（160%）。
+        """最小 30%（2026-10-11 抬上来的，以前按"桌面图标大小"≈12%，太小基本没法用）；
+        最大至少给到 SCALE_MAX_WISH（160%）。
 
         早先的算法是"角色不超过半屏"（面积约 1/4 屏幕），屏幕不高的机器上只能放大到
         120%~140%；现在改成：先按半屏算，但至少给到 160%，再用"整个窗口要能放进屏幕"
@@ -2404,12 +4050,13 @@ class PetHost:
         # 角色本身贴着底边画，所以顶出去一点不影响看角色，卡片也会自动贴回屏幕内。
         too_big = min(screen_w / WINDOW_W, screen_h / (WINDOW_H * 0.8))
         max_scale = min(max(half_screen, SCALE_MAX_WISH), max(1.0, too_big))
-        min_scale = max(ICON_SIZE / float(WINDOW_W), ICON_SIZE / float(WINDOW_H))
+        min_scale = max(SCALE_MIN, ICON_SIZE / float(WINDOW_W), ICON_SIZE / float(WINDOW_H))
         return round(min_scale, 3), round(max(1.0, min(max_scale, 4.0)), 2)
 
     def apply_settings(self, incoming: dict) -> None:
         """保存设置。注意：这个函数可能跑在设置窗口的线程上，
         所以所有"碰窗口"的动作都要回到桌宠自己的 UI 线程去做（跨线程会让界面卡死）。"""
+        started = time.time()
         merged = dict(self.settings)
         merged.update({k: v for k, v in (incoming or {}).items() if k != "availableExpressions"})
         low, high = self.scale_limits()
@@ -2418,23 +4065,19 @@ class PetHost:
         except (TypeError, ValueError):
             merged["scale"] = 1.0
         self.settings = settings_store.save(merged)
-        # 开机自启这类"外部动作"跟着保存一起生效（设置界面现在改成点保存才应用）
+        # 开机自启这类"外部动作"跟着保存一起生效，但要起子进程去写启动项，
+        # 一律放后台线程：点「保存」必须立刻有反应，界面线程更不能被拖住。
         want_autostart = bool(merged.get("autostart", os.path.exists(startup_link_path())))
-        if want_autostart != os.path.exists(startup_link_path()):
-            self.toggle_autostart(want_autostart)
-        want_follow = bool(merged.get("followCodex", codex_follow_enabled()))
-        if want_follow != codex_follow_enabled():
-            self.toggle_codex_follow(want_follow)
         self.invoke_on_pet(self.apply_settings_ui)
         log(
-            "设置已保存：缩放 %.2f / 跟随桌面 %s / 置顶 %s / 自动表情 %s / 自动动作 %s / 跟随Codex启动 %s / 动作 %d/%d / 表情 %d/%d"
+            "设置已保存：接入 %s / 缩放 %.2f / 跟随桌面 %s / 置顶 %s / 自动表情 %s / 自动动作 %s / 动作 %d/%d / 表情 %d/%d"
             % (
+                self.settings.get("agent", "codex"),
                 self.settings.get("scale", 1.0),
                 self.settings.get("followDesktop"),
                 self.settings.get("alwaysOnTop"),
                 self.settings.get("autoExpression"),
                 self.settings.get("autoMotion"),
-                codex_follow_enabled(),
                 self.allowed_motion_count(),
                 len(self.motion_inventory()),
                 self.allowed_expression_count(),
@@ -2442,6 +4085,18 @@ class PetHost:
             )
         )
         self.push_settings()
+
+        def external() -> None:
+            try:
+                if want_autostart != os.path.exists(startup_link_path()):
+                    self.toggle_autostart(want_autostart)
+            except Exception as exc:  # noqa: BLE001
+                log("应用启动项设置失败：%r" % (exc,))
+
+        threading.Thread(target=external, name="apply-external", daemon=True).start()
+        spent = time.time() - started
+        if spent > 0.5:
+            log("保存设置这一步耗时 %.1f 秒（正常应该是毫秒级，记下来方便查）" % spent)
 
     def invoke_on_pet(self, fn) -> None:
         """把动作丢回桌宠的 UI 线程执行（跨线程碰 WinForms 会让界面无响应）。"""
@@ -2458,13 +4113,22 @@ class PetHost:
 
     def apply_settings_ui(self) -> None:
         try:
+            self.ui_phase("应用设置")
             if getattr(self, "form", None) is None:
                 return
             global verbose_log
             verbose_log = bool(self.settings.get("verboseLog", False))
-            self.form.TopMost = bool(self.settings.get("alwaysOnTop", True))
-            self.form.Opacity = float(self.settings.get("opacity", 1.0))
-            self.pet_scale = float(self.settings.get("scale", 1.0))
+            # 这些属性一写就会走 SetWindowPos / DWM，合成器忙的时候能卡一两秒；
+            # 值没变就别去碰它（保存设置时会走这里，每次都写是浪费）。
+            want_top = bool(self.settings.get("alwaysOnTop", True))
+            if self.form.TopMost != want_top:
+                self.ui_phase("设置置顶")
+                self.form.TopMost = want_top
+            want_opacity = float(self.settings.get("opacity", 1.0))
+            if abs(self.form.Opacity - want_opacity) > 0.01:
+                self.ui_phase("设置不透明度")
+                self.form.Opacity = want_opacity
+            self.pet_scale = max(SCALE_MIN, float(self.settings.get("scale", 1.0)))
             base = (PANEL_W, PANEL_H) if self.panel_open else (WINDOW_W, WINDOW_H)
             self.resize_window(*base)
             if self.card is not None and not self.card.IsDisposed:
@@ -2512,15 +4176,20 @@ class PetHost:
             self.toggle_autostart(name.endswith("on"))
         elif name == "clear-log":
             cleared = []
-            for path in (log_path, os.path.join(HERE, "watcher.log")):
-                try:
-                    if os.path.exists(path):
-                        open(path, "w", encoding="utf-8").close()
-                        cleared.append(os.path.basename(path))
-                except OSError:
-                    pass
+            try:
+                if os.path.exists(log_path):
+                    open(log_path, "w", encoding="utf-8").close()
+                    cleared.append(os.path.basename(log_path))
+            except OSError:
+                pass
             log("已清空日志：%s" % (", ".join(cleared) or "无"), force=True)
             self.push_settings()
+        elif name == "clear-cache":
+            self.clear_webview_cache()
+        elif name == "create-desktop-link":
+            self.create_desktop_link()
+        elif name == "remove-desktop-link":
+            self.remove_desktop_link()
         elif name == "motion":
             self.post({"t": "say", "text": "随机动作"})
 
@@ -2529,28 +4198,6 @@ class PetHost:
 
         area = Screen.PrimaryScreen.WorkingArea
         return (area.Left, area.Top, area.Right, area.Bottom)
-
-    def toggle_codex_follow(self, enable: bool) -> None:
-        """调用原有的跟随 Codex 启动开/关脚本，把状态真正写进 Windows 启动项。"""
-        script = os.path.join(HERE, "跟随Codex启动-开启.cmd" if enable else "跟随Codex启动-关闭.cmd")
-        if not os.path.exists(script):
-            log("找不到跟随 Codex 启动脚本：%s" % script)
-            return
-        try:
-            import subprocess
-
-            creation = 0x08000000  # CREATE_NO_WINDOW
-            subprocess.run(
-                ["cmd.exe", "/d", "/c", script],
-                cwd=HERE,
-                creationflags=creation,
-                timeout=25,
-            )
-            done = codex_follow_enabled() == bool(enable)
-            log("跟随 Codex 启动已%s%s" % ("开启" if enable else "关闭", "" if done else "（未能确认启动项状态）"))
-        except Exception as exc:  # noqa: BLE001
-            log("切换跟随 Codex 启动失败：%r" % (exc,))
-        self.push_settings()
 
     def toggle_autostart(self, enable: bool) -> None:
         script = os.path.join(HERE, "pet-launcher.ps1")
@@ -2612,17 +4259,38 @@ class PetHost:
 # -------------------------------------------------------------------- state feed
 
 
+def usage_line(host: PetHost) -> str:
+    """进度卡片右下角那行小字：今日新增 / 本会话累积（设置里可切、可关）。
+
+    只读本地记录、不联网；算不出来就返回空字符串，卡片那格留空。
+    """
+    try:
+        import usage_stats
+
+        settings = host.settings or {}
+        mode = str(settings.get("usageMode") or "today")
+        agent = str(settings.get("agent") or "codex")
+        return usage_stats.usage_text(mode, agent)
+    except Exception as exc:  # noqa: BLE001
+        log("读取用量失败：%r" % (exc,))
+        return ""
+
+
 def state_loop(host: PetHost, interval: float = 1.0) -> None:
-    import codex_state
+    import agent_state
 
     last_payload = None
     last_send = 0.0
+    last_tick = 0.0
+    agent_id = ""
     while True:
         try:
-            payload = codex_state.snapshot()
+            agent_id = str((host.settings or {}).get("agent") or "codex")
+            payload = agent_state.snapshot(agent_id)
         except Exception as exc:  # noqa: BLE001
-            log("读取 Codex 状态失败：%r" % (exc,))
+            log("读取 %s 状态失败：%r" % (agent_id or "Agent", exc,))
             payload = {"state": "idle", "label": "空闲", "title": "", "activity": ""}
+        payload["usage"] = usage_line(host)      # 卡片右下角那行小字（今日新增 / 本会话累积）
         trimmed = json.dumps(payload, ensure_ascii=False, sort_keys=True)
         host.last_payload = payload
         host.schedule_card_update(payload)
@@ -2631,26 +4299,30 @@ def state_loop(host: PetHost, interval: float = 1.0) -> None:
             host.post({"t": "state", "data": payload})
             last_payload = trimmed
             last_send = now
-        else:
+        elif host.inline_card_open and now - last_tick >= 2.0:
+            # 卡片没展开就没必要每秒投递；开着也 2 秒一次 —— 每次投递都有卡住的风险
             host.post({"t": "tick", "data": {"elapsed": payload.get("elapsed"), "state": payload.get("state")}})
+            last_tick = now
         time.sleep(interval)
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Codex 桌宠")
+    parser = argparse.ArgumentParser(description="Agent 桌宠")
     parser.add_argument("--selftest", type=float, default=0, help="加载界面 N 秒后自动截取状态并退出")
     parser.add_argument("--state-only", action="store_true", help="只打印状态，不开窗口")
+    parser.add_argument("--agent", default="", help="配合 --state-only：读哪个 agent（默认用设置里的）")
     parser.add_argument("--shot", default="", help="把形象画布导出成 PNG（自检用）")
     args = parser.parse_args()
 
     if args.state_only:
-        import codex_state
+        import agent_state
 
-        print(json.dumps(codex_state.snapshot(), ensure_ascii=False, indent=2))
+        agent_id = args.agent or str(settings_store.load().get("agent") or "codex")
+        print(json.dumps(agent_state.snapshot(agent_id), ensure_ascii=False, indent=2))
         return 0
 
     if not single_instance():
-        print("Codex 桌宠已经在运行了", flush=True)
+        print("Agent 桌宠已经在运行了", flush=True)
         return 0
 
     global verbose_log
@@ -2666,6 +4338,7 @@ def main() -> int:
 
     set_dpi_awareness()
     install_exception_logging()
+    install_stack_dumps()
     port = start_server()
 
     result = {}

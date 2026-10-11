@@ -10,6 +10,3 @@ clr-loader==0.3.1
 cffi==2.1.1
 pycparser==3.0
 typing_extensions==4.16.0
-
-# 只有 restore_props.py / 恢复道具动画.cmd（恢复模型里的道具动画）需要：
-pillow==12.3.0

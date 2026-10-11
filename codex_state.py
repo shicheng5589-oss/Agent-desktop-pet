@@ -108,6 +108,61 @@ def _command_hint(arguments: str) -> str:
     return os.path.basename(token.strip("\"'"))[:24]
 
 
+TOOL_ACTIVITY_KINDS = {
+    "function_call", "custom_tool_call", "commandExecution", "fileChange",
+    "mcpToolCall", "webSearch", "toolSearch",
+}
+COMPLETION_KINDS = {"message", "agentMessage", "task_complete"}
+
+
+def _decide_codex_state(
+    *,
+    turn_status: str,
+    turn_error: bool,
+    aborted: bool,
+    finished: bool,
+    pending_open: bool,
+    latest_kind: str,
+    last_message: str,
+    age: float,
+) -> tuple[str, str]:
+    """把 Codex 回合生命周期和最近活动合成一个稳定状态。"""
+    status = str(turn_status or "").strip().lower()
+    if turn_error or status in ("error", "failed"):
+        return "error", "出错了"
+    if aborted or status in ("interrupted", "cancelled", "canceled", "aborted"):
+        return "interrupted", "被打断"
+
+    completed = finished or status in ("completed", "complete", "done", "success")
+    if completed:
+        if age < 90.0:
+            return "done", "完成了"
+        if age < 1800.0:
+            return "waiting", "等待你"
+        return "idle", "空闲"
+
+    if status in ("inprogress", "in_progress", "in-progress", "running", "active"):
+        # 回合还开着就不能因为“45 秒没写日志”就演等待用户。没有未结工具时，
+        # 最近步骤是工具就执行中，否则（reasoning / 输出整理）是思考中。
+        if pending_open or latest_kind in TOOL_ACTIVITY_KINDS:
+            return "working", "执行中"
+        return "thinking", "思考中"
+
+    if pending_open or latest_kind in TOOL_ACTIVITY_KINDS:
+        return "working", "执行中"
+    if last_message or latest_kind in COMPLETION_KINDS:
+        if age < 90.0:
+            return "done", "完成了"
+        if age < 1800.0:
+            return "waiting", "等待你"
+        return "idle", "空闲"
+    if age < 45.0:
+        return "thinking", "思考中"
+    if age < 1800.0:
+        return "waiting", "等待你"
+    return "idle", "空闲"
+
+
 def _item_activity(item: dict) -> str:
     kind = item.get("type") or ""
     label = TOOL_LABELS.get(kind, "处理中")
@@ -264,9 +319,10 @@ def snapshot() -> dict:
             start = index
 
     turn_events = events[start:]
-    tool_calls: dict[str, str] = {}
+    pending_calls: dict[str, dict] = {}
     completed: set[str] = set()
-    pending: dict | None = None
+    progress_after = -1
+    latest_event_kind = ""
     tools = 0
     last_reasoning = 0.0
     last_message = ""
@@ -275,7 +331,7 @@ def snapshot() -> dict:
     aborted = False
     finished = False
 
-    for event in turn_events:
+    for event_index, event in enumerate(turn_events):
         stamp = _iso_seconds(event.get("timestamp", "")) or last_stamp
         last_stamp = stamp or last_stamp
         kind = event.get("type")
@@ -300,10 +356,15 @@ def snapshot() -> dict:
                     )
             elif ptype == "item_completed":
                 item = payload.get("item") or {}
-                if item.get("type") == "Reasoning":
+                item_type = str(item.get("type") or "")
+                if item_type == "Reasoning":
                     last_reasoning = stamp or last_reasoning
-                elif item.get("type") == "AgentMessage":
+                    latest_event_kind = "reasoning"
+                    progress_after = max(progress_after, event_index)
+                elif item_type == "AgentMessage":
                     last_message = item.get("text") or last_message
+                    latest_event_kind = "agentMessage"
+                    progress_after = max(progress_after, event_index)
             continue
 
         if kind != "response_item":
@@ -311,15 +372,24 @@ def snapshot() -> dict:
 
         if ptype in ("function_call", "custom_tool_call"):
             tools += 1
-            call_id = payload.get("call_id") or payload.get("id") or ""
-            name = payload.get("name") or ""
+            call_id = str(payload.get("call_id") or payload.get("id") or "")
+            name = str(payload.get("name") or "")
             args = payload.get("arguments") or payload.get("input") or ""
-            tool_calls[call_id] = name
-            pending = {"call_id": call_id, "name": name, "arguments": args, "stamp": stamp}
+            pending_calls[call_id] = {
+                "call_id": call_id,
+                "name": name,
+                "arguments": args,
+                "stamp": stamp,
+                "index": event_index,
+            }
+            latest_event_kind = ptype
         elif ptype in ("function_call_output", "custom_tool_call_output"):
-            completed.add(payload.get("call_id") or "")
+            completed.add(str(payload.get("call_id") or ""))
+            latest_event_kind = "tool_output"
         elif ptype == "reasoning":
             last_reasoning = stamp or last_reasoning
+            latest_event_kind = "reasoning"
+            progress_after = max(progress_after, event_index)
         elif ptype == "message":
             if payload.get("role") == "assistant":
                 texts = []
@@ -328,44 +398,66 @@ def snapshot() -> dict:
                         texts.append(chunk["text"])
                 if texts:
                     last_message = "\n".join(texts)
+                    latest_event_kind = "agentMessage"
+                    progress_after = max(progress_after, event_index)
 
-    pending_open = bool(pending and pending["call_id"] not in completed)
+    open_calls = []
+    for call_id, call in pending_calls.items():
+        if call_id in completed:
+            continue
+        # function_call_output 偶尔缺失/晚到；之后已经出现 reasoning/assistant 输出，
+        # 说明模型已经越过这次调用，不能再把旧调用永久当成“执行中”。
+        if call.get("index", 0) < progress_after:
+            continue
+        if now - call.get("stamp", now) > 1800.0:
+            continue
+        open_calls.append(call)
+    open_calls.sort(key=lambda item: item.get("index", -1))
+    pending = open_calls[-1] if open_calls else None
+    pending_open = bool(pending)
     quiet_for = now - (last_stamp or now)
 
     items = _last_items(thread_id)
     latest_item = items[0] if items else {}
     latest_activity = _item_activity(latest_item) if latest_item else ""
     activity_stamp = latest_item.get("_ordinal")
+    latest_db_kind = str(latest_item.get("type") or "")
+    latest_kind = latest_event_kind or latest_db_kind
 
     turn = _turn_status(thread_id)
-    turn_status = turn.get("status") or ""
+    turn_status = str(turn.get("status") or "")
     started_at = turn.get("started_at") or 0
-    elapsed = max(0, int(now - started_at)) if started_at and turn_status == "inProgress" else 0
+    try:
+        completed_at = float(turn.get("completed_at") or 0.0)
+    except (TypeError, ValueError):
+        completed_at = 0.0
+    turn_error = bool(turn.get("error_json"))
+    elapsed = max(0, int(now - started_at)) if started_at and turn_status.lower() == "inprogress" else 0
 
-    # ---- decide the state -------------------------------------------------
-    if aborted or turn_status == "interrupted":
-        state, label = "interrupted", "被打断"
-    elif finished or turn_status == "completed":
-        if quiet_for < 90:
-            state, label = "done", "完成了"
-        else:
-            return {**idle_payload, "title": meta.get("label") or "", "tokens": tokens_text}
-    elif pending_open:
-        name = pending["name"] or ""
-        if name in ("tool_search", "tool_search_tool"):
-            state, label = "review", "找工具"
-        else:
-            state, label = "working", "执行中"
-    elif quiet_for > 45:
-        state, label = "waiting", "等待你"
-    else:
-        state, label = "thinking", "思考中"
+    state, label = _decide_codex_state(
+        turn_status=turn_status,
+        turn_error=turn_error,
+        aborted=aborted,
+        finished=finished,
+        pending_open=pending_open,
+        latest_kind=latest_kind,
+        last_message=last_message,
+        age=max(0.0, now - max(last_stamp, completed_at or 0.0, last_reasoning or 0.0)),
+    )
+    if pending and pending.get("name") in ("tool_search", "tool_search_tool"):
+        state, label = "review", "找工具"
 
     activity = latest_activity
-    if state == "thinking":
-        activity = "正在思考下一步" if not activity else activity
-    if state == "waiting":
-        activity = activity or "等你确认或回复"
+    if state == "working":
+        activity = ("调用工具 · %s" % pending["name"]) if pending and pending.get("name") else "正在执行这一步"
+    elif state == "thinking":
+        activity = "正在思考下一步"
+    elif state == "done":
+        activity = "任务完成"
+    elif state == "waiting":
+        activity = "等你确认或回复"
+    elif state == "idle":
+        activity = ""
 
     return {
         "state": state,

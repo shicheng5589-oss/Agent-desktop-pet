@@ -1,4 +1,4 @@
-/* 设置界面：所有改动即时生效（改滑块松手、勾选、下拉都会立刻应用） */
+/* 设置界面：改动先标记为未保存，点「保存并应用」后才真正生效。 */
 
 const STATES = [
   ["thinking", "思考中", "#7aa2ff"],
@@ -41,7 +41,7 @@ const BOTTOM_ACTION_OPTIONS = {
   codex: [
     ["none", "无功能"],
     ["codex-new-session", "新建会话", "新建 Codex 会话"],
-    ["codex-focus", "切到 Codex", "切到 Codex / 定位输入框"],
+    ["codex-focus", "切到 Agent 窗口", "切到所选的 Agent 的窗口（Codex / Claude / Gemini / OpenClaw / Hermes / DeepSeek Harness / ZCode / WorkBuddy / OpenCode / Kimi Code / Xiaomi MiMo / Qwen Code）"],
     ["codex-rename-task", "重命名任务", "重命名当前任务（复制新名称）"],
     ["codex-add-note", "添加备注"],
     ["codex-interrupt", "打断任务", "打断当前任务"],
@@ -79,7 +79,8 @@ const DEFAULTS = {
   cardScaleWithPet: true,
   followDesktop: true,
   autostart: false,
-  followCodex: false,
+  agent: "codex",
+  usageMode: "today",
   wheelZoom: true,
   cardBlur: true,
   verboseLog: false,
@@ -107,14 +108,16 @@ const STATE_DEFAULT_EXPR = {
 // 每一栏"恢复默认"管哪些设置
 const RESET_SCOPES = {
   appearance: ["scale", "opacity", "gazeRange", "autoExpression", "autoMotion", "alwaysOnTop", "showChip", "fpsLimit"],
-  behavior: ["cardStyle", "cardGap", "cardScaleWithPet", "followDesktop", "autostart", "followCodex", "wheelZoom", "cardBlur"],
+  agent: ["agent", "usageMode", "autostart"],
+  card: ["cardStyle", "cardGap", "cardScaleWithPet", "followDesktop", "wheelZoom", "cardBlur"],
   bottom: ["bottomButtonsMode"],
   motions: ["moodSeconds", "moodChance", "motionChance", "idleMotionSeconds", "motionGap"],
   debug: ["verboseLog"],
 };
 const RESET_SCOPE_NAMES = {
   appearance: "外观",
-  behavior: "行为",
+  agent: "Agent",
+  card: "卡片",
   bottom: "底部按钮与功能方案",
   states: "状态对应的表情",
   whitelist: "表情白名单",
@@ -267,6 +270,7 @@ function collect() {
     alwaysOnTop: $("alwaysOnTop").checked,
     showChip: $("showChip").checked,
     followDesktop: $("followDesktop").checked,
+    usageMode: $("usageMode").value,
     wheelZoom: $("wheelZoom").checked,
     cardBlur: $("cardBlur").checked,
     cardStyle: $("cardStyle").value,
@@ -298,7 +302,7 @@ function collect() {
     expressions,
     // 开机自启：保存时和后端的"启动项是否存在"比一下，不一致就装上 / 卸掉
     autostart: $("autostart").checked,
-    followCodex: $("followCodex").checked,
+    agent: $("agent").value || "codex",
   };
 }
 
@@ -321,7 +325,79 @@ function saveNow() {
   flash("已应用 ✓");
 }
 
+let agentStatus = {};   // 各 agent 的本地记录检测结果（后端 push_settings 送来）
+
+/** 接入的 Agent：两列网格（第一列先排满，再排第二列）。 */
+function fillAgentList(list) {
+  const box = $("agent");
+  if (!box || box.dataset.filled === "1") return;
+  const items = list && list.length ? list : [{ id: "codex", name: "Codex", shared: true }];
+  const rows = Math.max(1, Math.ceil(items.length / 2));
+  box.style.gridTemplateRows = "repeat(" + rows + ", minmax(0, auto))";
+  items.forEach((item) => {
+    const cell = document.createElement("button");
+    cell.type = "button";
+    cell.className = "agent-cell";
+    cell.dataset.agentId = item.id;
+    cell.dataset.shared = item.shared ? "1" : "0";
+    cell.setAttribute("role", "radio");
+    cell.setAttribute("aria-checked", "false");
+    const name = document.createElement("span");
+    name.className = "agent-name";
+    name.textContent = item.name;
+    const tick = document.createElement("span");
+    tick.className = "tick";
+    tick.textContent = "✓";
+    cell.append(name, tick);
+    cell.addEventListener("click", () => selectAgent(item.id));
+    box.appendChild(cell);
+  });
+  box.dataset.filled = "1";
+}
+
+/** 选中某个 agent：点亮 + 刷新记录提示。silent = 回填页面时用（不动"未保存"状态）。 */
+function selectAgent(id, silent) {
+  const box = $("agent");
+  if (!box) return;
+  const want = id || "codex";
+  box.value = want;
+  box.querySelectorAll(".agent-cell").forEach((cell) => {
+    const on = cell.dataset.agentId === want;
+    cell.classList.toggle("active", on);
+    cell.setAttribute("aria-checked", on ? "true" : "false");
+  });
+  updateAgentHint();
+  if (!silent) push();
+}
+
+/** 选中的 agent 有没有本地记录可读。桌面版/CLI 共用记录的 agent 不提示（它们本来就一直有）。 */
+function updateAgentHint() {
+  const el = $("agent-hint");
+  const sel = $("agent");
+  if (!el || !sel) return;
+  const id = sel.value || "codex";
+  const cell = sel.querySelector('.agent-cell[data-agent-id="' + id + '"]');
+  const info = agentStatus[id] || {};
+  const shared = (cell && cell.dataset.shared === "1") || id === "codex";
+  if (shared) {
+    el.textContent = "";
+    el.style.display = "none";
+    return;
+  }
+  const bridge = "~/.codexpet/status/" + id + ".json";
+  el.style.display = "";
+  if (info.found) {
+    el.textContent = "✓ 可读本地记录（" + (info.detail || "已检测到") + "）";
+    el.style.color = "#3a9d5d";
+  } else {
+    el.textContent = "○ 还没读到本地记录——用它跑一次就有了；也可以走状态桥：" +
+      "python status-bridge.py --agent " + id + " --state working（写进 " + bridge + "）";
+    el.style.color = "#8a6d1f";
+  }
+}
+
 function render(cfg) {
+  const __t0 = performance.now();
   current = cfg;
   if (cfg.scaleMin != null) $("scale").min = cfg.scaleMin;
   if (cfg.scaleMax != null) $("scale").max = cfg.scaleMax;
@@ -336,6 +412,7 @@ function render(cfg) {
   $("alwaysOnTop").checked = cfg.alwaysOnTop !== false;
   $("showChip").checked = cfg.showChip !== false;
   $("followDesktop").checked = cfg.followDesktop !== false;
+  $("usageMode").value = cfg.usageMode || "today";
   $("wheelZoom").checked = cfg.wheelZoom !== false;
   $("cardBlur").checked = cfg.cardBlur !== false;
   $("cardStyle").value = cfg.cardStyle === "solid" ? "solid" : "glass";
@@ -350,7 +427,10 @@ function render(cfg) {
   $("idleMotionSeconds").value = cfg.idleMotionSeconds != null ? cfg.idleMotionSeconds : 6;
   $("motionGap").value = cfg.motionGapSeconds != null ? cfg.motionGapSeconds : 4;
   $("autostart").checked = Boolean(cfg.autostart);
-  $("followCodex").checked = Boolean(cfg.followCodex);
+  agentStatus = cfg.agentStatus || {};
+  fillAgentList(cfg.agentList);
+  selectAgent(cfg.agent || "codex", true);
+  updateAgentHint();
   $("expr-count").textContent = (cfg.availableExpressions || []).length;
   syncOutputs();
   $("expr-total").textContent = String((cfg.availableExpressions || []).length);
@@ -362,14 +442,21 @@ function render(cfg) {
     `、表情 ${allowed.expressions ?? "?"}/${allowed.expressionTotal ?? "?"}`;
   $("scale-hint").textContent =
     cfg.scaleMin != null && cfg.scaleMax != null
-      ? `最小≈桌面图标，最大按屏幕高度兜底（${Math.round(cfg.scaleMin * 100)}%–${Math.round(cfg.scaleMax * 100)}%）`
+      ? `可调范围 ${Math.round(cfg.scaleMin * 100)}%–${Math.round(cfg.scaleMax * 100)}%（上限按你的屏幕高度兜底）`
       : "";
   if (cfg.logPath) $("paths").textContent = `日志：${cfg.logPath}`;
+  $("cache-size").textContent = cfg.cacheText || "—";
+  const hasDesktopLink = Boolean(cfg.desktopLink);
+  $("desktop-link").textContent = hasDesktopLink ? "已创建" : "未创建";
+  $("desktop-link").dataset.exists = hasDesktopLink ? "1" : "0";
+  $("act-desktop-link").textContent = hasDesktopLink ? "删除桌面快捷方式" : "创建桌面快捷方式";
   buildStateGrid(cfg.availableExpressions || [], cfg.expressions || {});
   buildMotionList(cfg.motions || [], cfg.motionAllowed || []);
   buildExpressionList(cfg.availableExpressions || [], cfg.expressionAllowed || ["*"]);
   baseline = JSON.stringify(collect());   // 刚刚同步下来的就是"已应用"的状态
   markDirty();
+  const __spent = performance.now() - __t0;
+  if (__spent > 300) bridge.send({ t: "perf", data: { renderMs: Math.round(__spent) } });
 }
 
 function buildExpressionList(expressions, allowed) {
@@ -439,6 +526,7 @@ function applyDefaults(keys) {
     const value = DEFAULTS[id];
     if (el.type === "checkbox") el.checked = Boolean(value);
     else el.value = value;
+    if (id === "agent") selectAgent(value, true);
   }
 }
 
@@ -497,7 +585,7 @@ function wire() {
   $("gazeRange").addEventListener("change", push);
   $("moodSeconds").addEventListener("input", () => ($("mood-out").textContent = Number($("moodSeconds").value) + " 秒"));
   $("moodSeconds").addEventListener("change", push);
-  ["alwaysOnTop", "showChip", "followDesktop", "wheelZoom", "cardBlur", "followCodex"].forEach((id) =>
+  ["alwaysOnTop", "showChip", "followDesktop", "wheelZoom", "cardBlur", "usageMode"].forEach((id) =>
     $(id).addEventListener("change", push)
   );
   $("cardStyle").addEventListener("change", push);
@@ -586,14 +674,25 @@ function wire() {
     "act-clear-log": "clear-log",
     "act-folder": "open-folder",
     "act-reload": "reload",
+    "act-clear-cache": "clear-cache",
     "act-quit": "quit",
   };
   for (const [id, name] of Object.entries(actions)) {
     $(id).addEventListener("click", () => {
+      if (name === "clear-cache") {
+        const size = ($("cache-size") && $("cache-size").textContent) || "—";
+        if (!window.confirm(`清除 WebView2 缓存（当前 ${size}）会关闭桌宠、清理后自动重启。\n首次加载会稍慢，继续吗？`)) return;
+      }
       bridge.send({ t: "action", name });
       if (name !== "quit") flash("已发送 ✓");
     });
   }
+
+  $("act-desktop-link").addEventListener("click", () => {
+    const exists = ($("desktop-link") && $("desktop-link").dataset.exists) === "1";
+    bridge.send({ t: "action", name: exists ? "remove-desktop-link" : "create-desktop-link" });
+    flash(exists ? "已请求删除 ✓" : "已请求创建 ✓");
+  });
 
   $("act-defaults").addEventListener("click", () => {
     // 只把界面填成默认值（不立即生效），点「保存并应用」后才真正生效
@@ -641,7 +740,23 @@ if (!(window.chrome && window.chrome.webview)) {
       followDesktop: true,
       showChip: true,
       autostart: false,
-      followCodex: false,
+      agent: "codex",
+      agentList: [
+        { id: "codex", name: "Codex", shared: true },
+        { id: "claude", name: "Claude Code CLI", shared: false },
+        { id: "gemini", name: "Gemini CLI", shared: false },
+        { id: "openclaw", name: "OpenClaw CLI", shared: false },
+        { id: "hermes", name: "Hermes CLI", shared: false },
+        { id: "opencode", name: "OpenCode", shared: true },
+        { id: "dsh", name: "DeepSeek Harness", shared: true },
+        { id: "workbuddy", name: "WorkBuddy", shared: true },
+        { id: "mimo", name: "Xiaomi MiMo", shared: true },
+        { id: "zcode", name: "ZCode", shared: true },
+        { id: "kimi", name: "Kimi Code", shared: true },
+        { id: "qwen", name: "Qwen Code CLI", shared: false },
+      ],
+      agentStatus: { claude: { found: true, detail: "最近更新 2 分钟前" } },
+      usageMode: "today",
       availableExpressions: ["呆呆眼", "开心兴奋", "感叹号", "方眼镜", "流汗", "生气", "哭", "爱心眼", "晕晕", "调皮", "吐舌", "脸红", "星星眼", "猫猫贴纸", "问号"],
       expressions: { thinking: "呆呆眼", working: "开心兴奋", waiting: "感叹号", done: "爱心眼" },
       motions: [
@@ -659,6 +774,8 @@ if (!(window.chrome && window.chrome.webview)) {
       motionChance: 30,
       idleMotionSeconds: 6,
       motionGapSeconds: 4,
+      cacheText: "372.4 MB",
+      desktopLink: true,
       logPath: "C:\\...\\outputs\\CodexPet\\pet.log",
     });
   }, 50);

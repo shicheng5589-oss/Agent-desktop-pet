@@ -3,15 +3,15 @@
   <head>
     <meta charset="utf-8" />
     <link rel="icon" href="model/icon.png" />
-    <title>Codex 桌宠 · 设置</title>
+    <title>Agent 桌宠 · 设置</title>
     <link rel="stylesheet" href="settings.css" />
   </head>
   <body>
     <header class="head">
       <img src="model/icon.png" alt="" class="logo" />
       <div>
-        <h1>Codex 桌宠</h1>
-        <p class="sub">形象会跟着 Codex 的实时状态变化：思考 / 执行 / 等待 / 完成…</p>
+        <h1>Agent 桌宠</h1>
+        <p class="sub">形象会跟着接入 Agent 的实时状态变化：思考 / 执行 / 等待 / 完成…</p>
       </div>
     </header>
 
@@ -26,7 +26,7 @@
         </div>
         <label class="row">
           <span class="label">桌宠大小 <small id="scale-hint" class="hint-inline"></small></span>
-          <input type="range" id="scale" min="0.1" max="2" step="0.01" />
+          <input type="range" id="scale" min="0.3" max="2" step="0.01" />
           <output id="scale-out" class="value"></output>
         </label>
         <label class="row">
@@ -72,8 +72,35 @@
 
       <section class="card">
         <div class="card-head">
-          <h2>行为</h2>
-          <button type="button" class="icon-btn" data-reset="behavior" title="把「行为」这一栏恢复默认（改完记得点「保存并应用」）" aria-label="恢复默认">
+          <h2>Agent</h2>
+          <button type="button" class="icon-btn" data-reset="agent" title="把「Agent」这一栏恢复默认（改完记得点「保存并应用」）" aria-label="恢复默认">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20.3 12a8.3 8.3 0 1 1-2.44-5.88" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round"/><path d="M20.5 3.6v5.1h-5.1" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+        </div>
+        <div class="row">
+          <span class="label">接入的 Agent（进度卡片、表情、用量都跟着它走）</span>
+        </div>
+        <div id="agent" class="agent-grid" role="radiogroup" aria-label="接入的 Agent"></div>
+        <p class="hint" id="agent-hint"></p>
+        <label class="row">
+          <span class="label">卡片底部显示用量（今日新增＝当前接入的 Agent 今天用了多少；本会话累积＝它这一次会话用了多少）</span>
+          <select id="usageMode">
+            <option value="today">今日新增</option>
+            <option value="session">本会话累积</option>
+            <option value="off">不显示</option>
+          </select>
+        </label>
+        <p class="hint">统计 token 需要读取本地会话记录，修改后点「保存并应用」生效；保存后可能需要几秒到最多约 20 秒才会刷新，属正常现象。</p>
+        <label class="row switch">
+          <span class="label hot">开机自动启动</span>
+          <input type="checkbox" id="autostart" />
+        </label>
+      </section>
+
+      <section class="card">
+        <div class="card-head">
+          <h2>卡片</h2>
+          <button type="button" class="icon-btn" data-reset="card" title="把「卡片」这一栏恢复默认（改完记得点「保存并应用」）" aria-label="恢复默认">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20.3 12a8.3 8.3 0 1 1-2.44-5.88" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round"/><path d="M20.5 3.6v5.1h-5.1" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"/></svg>
           </button>
         </div>
@@ -98,14 +125,6 @@
           <input type="checkbox" id="followDesktop" />
         </label>
         <label class="row switch">
-          <span class="label hot">开机自动启动</span>
-          <input type="checkbox" id="autostart" />
-        </label>
-        <label class="row switch">
-          <span class="label hot">跟随 Codex 启动（Codex 打开时自动拉起桌宠）</span>
-          <input type="checkbox" id="followCodex" />
-        </label>
-        <label class="row switch">
           <span class="label">鼠标滚轮缩放桌宠（关掉则只能用上面的滑条缩放）</span>
           <input type="checkbox" id="wheelZoom" />
         </label>
@@ -117,7 +136,7 @@
           <button class="btn" id="act-panel">展开 / 收起进度卡片</button>
           <button class="btn" id="act-motion">让它做个动作</button>
           <button class="btn" id="act-reset">回到右下角</button>
-          <button class="btn" id="act-codex">切到 Codex 窗口</button>
+          <button class="btn" id="act-codex">切到 Agent 窗口</button>
         </div>
       </section>
 
@@ -135,8 +154,8 @@
         <label class="row">
           <span class="label">功能方案</span>
           <select id="bottomButtonsMode">
-            <option value="assistant">方案一：桌宠编辑 / 恢复 / 清理</option>
-            <option value="codex">方案二：Codex 联动</option>
+            <option value="assistant">桌宠编辑 / 恢复 / 清理</option>
+            <option value="codex">Codex 联动</option>
           </select>
         </label>
         <div class="grid" id="bottom-button-actions"></div>
@@ -231,8 +250,12 @@
           <button class="btn ghost" id="act-clear-log">清空日志</button>
           <button class="btn ghost" id="act-folder">打开程序文件夹</button>
           <button class="btn ghost" id="act-reload">重新载入形象</button>
+          <button class="btn ghost" id="act-clear-cache">清除缓存并重启</button>
+          <button class="btn ghost" id="act-desktop-link">创建桌面快捷方式</button>
           <button class="btn danger" id="act-quit">退出桌宠</button>
         </div>
+        <p class="hint">WebView2 缓存：<b id="cache-size">—</b> · 「清空日志」只清文本日志（pet.log）；「清除缓存」清浏览器缓存（.webview2，通常 200–400MB），清完会自动重启，首次加载稍慢。</p>
+        <p class="hint">桌面快捷方式：<b id="desktop-link">—</b> · 首次启动会自动创建一个；不喜欢就点按钮删掉（删掉后不会再自动出现），需要时用按钮或文件夹里的「创建桌面快捷方式.cmd」重建。</p>
         <p class="hint" id="paths"></p>
       </section>
     </main>

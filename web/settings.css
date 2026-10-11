@@ -137,6 +137,61 @@ h2 {
   flex: 1;
 }
 
+/* 接入的 Agent：两列网格 —— 第一列先排满，再排第二列（顺序和 agentList 一致） */
+.agent-grid {
+  display: grid;
+  grid-auto-flow: column;
+  grid-template-rows: repeat(6, minmax(0, auto));
+  grid-auto-columns: minmax(0, 1fr);
+  gap: 8px 10px;
+  padding: 4px 0 2px;
+}
+
+.agent-cell {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 36px;
+  padding: 0 11px;
+  border: 1px solid var(--edge);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--ink);
+  font: inherit;
+  font-size: 12.5px;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.12s, background 0.12s, color 0.12s;
+}
+
+.agent-cell:hover {
+  border-color: rgba(110, 150, 255, 0.5);
+  background: rgba(90, 140, 255, 0.14);
+}
+
+.agent-cell .tick {
+  flex: 0 0 auto;
+  opacity: 0;
+  color: #8fb2ff;
+  font-size: 12px;
+}
+
+.agent-cell.active {
+  border-color: rgba(110, 150, 255, 0.75);
+  background: rgba(70, 110, 220, 0.3);
+  color: #ffffff;
+}
+
+.agent-cell.active .tick {
+  opacity: 1;
+}
+
+.agent-cell:focus-visible {
+  outline: 2px solid rgba(110, 150, 255, 0.6);
+  outline-offset: 1px;
+}
+
 .value {
   min-width: 42px;
   text-align: right;
@@ -202,6 +257,11 @@ input[type="checkbox"] {
 .hint-inline {
   color: var(--muted);
   font-size: 11.5px;
+}
+
+/* 排查栏的缓存占用数字：用红色标出来，一眼能看到（2026-10-11 加） */
+#cache-size {
+  color: #ff6b6b;
 }
 
 .grid {
