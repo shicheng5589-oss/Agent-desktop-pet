@@ -1,4 +1,6 @@
-# Codex 桌宠（CodexPet）
+# Agent 桌宠
+
+> 原名「Codex 桌宠」（CodexPet）；2.0 起接入 12 个 Agent，正式更名为 **Agent 桌宠**。
 
 一只贴在 Windows 桌面上的 Live2D 小桌宠：**它跟着 Codex（或你接入的其它 Agent）的实时状态换表情**——
 思考中、执行中、等待你、审阅找工具、同步中、被挡住、出错了、完成了、被打断，
@@ -10,7 +12,7 @@
 > **当前版本 2.0**（2026-10-11）：多 Agent 接入、任务栏等系统覆盖层输入隔离、状态判定优化、点击 / 拖动修复，
 > 详情见[更新日志](#更新日志)。
 
-<p align="center"><img src="docs/images/pet.png" alt="Codex 桌宠" width="220"></p>
+<p align="center"><img src="docs/images/pet.png" alt="Agent 桌宠" width="220"></p>
 
 ---
 
@@ -453,7 +455,7 @@ CodexPet/
 │  ├─ card.html / card.js / card.css       独立卡片窗口（默认不用）
 │  ├─ icon.ico / icon-transparent.ico     窗口 / 桌面快捷方式图标
 │  ├─ lib/                                 pixi + pixi-live2d-display + Cubism Core
-│  ├─ model/                               模型（moc3 / 贴图 / 动作 / 表情）+ settings.json
+│  ├─ model/                               模型（moc3 / 贴图 / 动作 / 表情）+ settings.json、README.md（模型授权说明）
 │  │                                       （另外几个 `*.vtube.json`、`items_pinned_to_model.json`
 │  │                                        等是 VTube Studio 的工程文件，程序不读，可自行决定留删）
 ├─ vendor/                        Python 依赖（pythonnet、WebView2 .NET 组件等）
@@ -495,6 +497,7 @@ CodexPet/
 
 **其它**
 
+* 项目更名：**「Codex 桌宠」→「Agent 桌宠」**（2.0 起不止跟着 Codex，名字与界面统一）。
 * 接入 12 个 Agent，详见[接入其它 Agent](#接入其它-agent)；卡片底部新增用量小字
   （今日新增 / 本会话累积）；状态桥 `status-bridge.py` 支持把任意 Agent 的状态喂给桌宠。
 * 桌面快捷方式「Agent 桌宠」首次启动自动创建（设置 → 排查里可删、可重建），新增 `创建桌面快捷方式.cmd`。
