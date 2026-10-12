@@ -24,6 +24,9 @@ desktop-link.done
 selftest.png
 黑边修复-用旧版.txt
 
+# 本地还原点（改代码前的备份，不进仓库）
+_备份/
+
 # Python 缓存
 __pycache__/
 *.py[cod]
