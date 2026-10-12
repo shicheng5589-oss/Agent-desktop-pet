@@ -133,9 +133,28 @@ WS_EX_TOOLWINDOW = 0x00000080
 WS_EX_NOACTIVATE = 0x08000000
 
 GA_ROOT = 2                      # GetAncestor：取顶层窗口
+GW_HWNDFIRST = 0                  # 同一层级最上方窗口
+GW_HWNDNEXT = 2                   # 同层级下一个窗口
 
 # Windows 任务栏/开始菜单等 Shell 覆盖层。它们永远高于桌宠；输入必须原样交给它们，
 # 不能因为光标坐标仍落在桌宠矩形里就触发摸头/拖动/缩放。
+SHELL_OVERLAY_PROCESS_NAMES = {
+    "shellexperiencehost.exe",
+    "startmenuexperiencehost.exe",
+    "shellhost.exe",
+    "sihost.exe",
+    "searchhost.exe",
+    "widgetservice.exe",
+    "textinputhost.exe",
+    "systemsettings.exe",
+    "controlcenter.exe",
+    "quicksettings.exe",
+}
+SHELL_OVERLAY_PROCESS_TOKENS = (
+    "shellexperiencehost", "startmenuexperiencehost", "shellhost",
+    "controlcenter", "quicksettings",
+)
+
 SHELL_OVERLAY_CLASSES = {
     "Shell_TrayWnd",
     "Shell_SecondaryTrayWnd",
@@ -181,6 +200,15 @@ user32.GetClassNameW.argtypes = [wt.HWND, ctypes.c_wchar_p, ctypes.c_int]
 user32.WindowFromPoint.argtypes = [wt.POINT]
 user32.WindowFromPoint.restype = wt.HWND
 user32.GetAncestor.argtypes = [wt.HWND, ctypes.c_uint]
+user32.GetWindow.argtypes = [wt.HWND, ctypes.c_uint]
+user32.GetWindow.restype = wt.HWND
+user32.GetTopWindow.argtypes = [wt.HWND]
+user32.GetTopWindow.restype = wt.HWND
+kernel32.OpenProcess.argtypes = [ctypes.c_uint, ctypes.c_int, ctypes.c_uint]
+kernel32.OpenProcess.restype = ctypes.c_void_p
+kernel32.QueryFullProcessImageNameW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_uint)]
+kernel32.QueryFullProcessImageNameW.restype = ctypes.c_int
+kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
 user32.GetWindowThreadProcessId.argtypes = [wt.HWND, ctypes.POINTER(ctypes.c_ulong)]
 user32.GetWindowRect.argtypes = [wt.HWND, ctypes.POINTER(wt.RECT)]
 user32.GetAncestor.restype = wt.HWND
@@ -249,17 +277,45 @@ def log(message: str, force: bool = False) -> None:
 def install_stack_dumps() -> None:
     """每 15 秒把所有线程的调用栈写进 pet-stacks.log（诊断"未响应"用）。
 
-    faulthandler 的定时器是**独立的 C 线程**：哪怕界面线程卡在某个 COM / sqlite 调用里，
-    它也能把当时的栈写出来 —— 卡死时这份文件就是第一现场。
+    纯 Python 实现（sys._current_frames + traceback）：只逐线程取 Python 层的栈，
+    不碰解释器内部结构。上一版用的 faulthandler 全线程转储（C 线程）在特定时序下
+    会踩空指针、把整个进程带崩（2026-10-11 排查：6 个崩溃转储全部死在
+    _Py_DumpTracebackThreads 里），所以换成这个不会崩的实现。
+    代价：解释器彻底卡到跑不了 Python 代码时写不出快照（那种场面交给鼠标看门狗兜底）。
     每次启动重写（只保留本次运行），想关掉就设环境变量 CODEXPET_NO_STACKDUMP=1。
     """
     if os.environ.get("CODEXPET_NO_STACKDUMP"):
         return
     try:
-        import faulthandler
+        import traceback
 
         handle = open(os.path.join(HERE, "pet-stacks.log"), "w", encoding="utf-8", buffering=1)
-        faulthandler.dump_traceback_later(15.0, repeat=True, file=handle, exit=False)
+
+        def dump_once() -> None:
+            names = {t.ident: t.name for t in threading.enumerate()}
+            frames = sys._current_frames()
+            handle.write(
+                "===== %s  线程栈快照（%d 个线程）=====\n"
+                % (time.strftime("%H:%M:%S"), len(frames))
+            )
+            for tid, frame in frames.items():
+                handle.write(
+                    "\nThread 0x%08x (%s) (most recent call first):\n"
+                    % (tid, names.get(tid, "?"))
+                )
+                for line in traceback.format_stack(frame):
+                    handle.write(line)
+            handle.flush()
+
+        def loop() -> None:
+            while True:
+                time.sleep(15.0)
+                try:
+                    dump_once()
+                except Exception:  # noqa: BLE001
+                    pass
+
+        threading.Thread(target=loop, name="pet-stacks", daemon=True).start()
         log("线程栈快照已开启：每 15 秒写一份 pet-stacks.log（只在排查卡死时有用）")
     except Exception as exc:  # noqa: BLE001
         log("开启线程栈快照失败（不影响使用）：%r" % (exc,))
@@ -867,6 +923,8 @@ class PetHost:
         self._menu_rect = None          # 菜单的屏幕矩形：用来判断左键点在菜单里还是外面
         self._menu_pos = None           # 菜单左上角（屏幕坐标）：快速切换面板就弹在同一个位置
         self._menu_close_at = 0.0       # "点了菜单外面"的兜底关闭请求（带时间戳，1 秒后作废）
+        self._menu_ghost_since = None   # 菜单"丢了鼠标捕获"从什么时候开始（幽灵菜单自检用）
+        self._menu_close_reason = ""    # 菜单是为什么关的（诊断用）
         self._ignore_click_until = 0.0  # 这一下点击属于菜单/下层窗口，别让底下的图标按钮跟着响应
 
     # -- window construction -------------------------------------------------
@@ -1390,9 +1448,42 @@ class PetHost:
             self._left_swallow_log = False
             log("已在系统分发前吃掉这一次左键：下面的窗口收不到，不会选中文字/误点图标")
         if self._menu_visible:
-            rect = self.menu_screen_rect()
-            if rect:
-                self._menu_rect = rect
+            menu = self.menu
+            if menu is None or menu.IsDisposed or not menu.Visible:
+                # 实际已经关了，但 Closed 事件万一没送到：把标记纠偏，
+                # 不然钩子会把后面的点击一直当成"菜单开着"处理
+                self._menu_visible = False
+                self._menu_rect = None
+                self._menu_ghost_since = None
+                log("菜单状态纠偏：实际已关闭，标记复位")
+            else:
+                rect = self.menu_screen_rect()
+                if rect:
+                    self._menu_rect = rect
+                # 幽灵菜单自检：菜单还画着、但鼠标捕获已经不在它手里 → 悬停高亮不会亮、
+                # 点着也别扭（要先去别处点一下才恢复，还会把菜单模式的快捷键一起吃掉）。
+                # 丢了就立刻补回捕获；补不回来（持续 2 秒）就收掉它，下次右键重弹。
+                try:
+                    captured = bool(menu.Capture)
+                except Exception:  # noqa: BLE001
+                    captured = True
+                if captured:
+                    self._menu_ghost_since = None
+                else:
+                    if not self._menu_ghost_since:
+                        self._menu_ghost_since = time.time()
+                        log("菜单丢了鼠标捕获，已尝试补回（悬停高亮依赖它）")
+                        try:
+                            menu.Capture = True
+                        except Exception:  # noqa: BLE001
+                            pass
+                    elif time.time() - self._menu_ghost_since > 2.0:
+                        self._menu_ghost_since = None
+                        log("菜单捕获一直补不回来（幽灵状态）：已收掉，下次右键重弹")
+                        try:
+                            menu.Close()
+                        except Exception:  # noqa: BLE001
+                            pass
         if self._menu_close_at:
             if time.time() - self._menu_close_at > 1.0:
                 self._menu_close_at = 0.0      # 过期作废：绝不能影响到下一次菜单
@@ -1551,11 +1642,81 @@ class PetHost:
         except Exception:
             return False
 
-    def point_on_shell_overlay(self, xy) -> bool:
-        """光标是不是落在任务栏/开始菜单等 Shell 覆盖层上。
+    @staticmethod
+    def _hwnd_value(handle) -> int:
+        """把 wt.HWND/ctypes.c_void_p 统一转成整数句柄。"""
+        try:
+            return int(handle)
+        except (TypeError, ValueError):
+            try:
+                return int(handle.value or 0)
+            except Exception:
+                return 0
 
-        对桌宠本体，色键透明会让 WindowFromPoint 答“下面的窗口”，所以不能把
-        “不是桌宠”一概当遮挡；这里只认明确的 Shell 覆盖层类，稳定且不会误伤桌宠。
+    @staticmethod
+    def _is_shell_overlay_process_name(name: str) -> bool:
+        base = os.path.basename(str(name or "")).lower()
+        return base in SHELL_OVERLAY_PROCESS_NAMES or any(token in base for token in SHELL_OVERLAY_PROCESS_TOKENS)
+
+    def _window_process_name(self, hwnd) -> str:
+        """读取顶层窗口进程名；只用于 Shell 面板白名单，不碰桌宠输入路径。"""
+        try:
+            pid = ctypes.c_ulong()
+            user32.GetWindowThreadProcessId(wt.HWND(hwnd), ctypes.byref(pid))
+            if not pid.value:
+                return ""
+            cache = getattr(self, "_overlay_process_cache", {})
+            cached = cache.get(pid.value)
+            now = time.time()
+            if cached and now - cached[1] < 30.0:
+                return cached[0]
+            handle = kernel32.OpenProcess(0x1000, 0, pid.value)
+            name = ""
+            if handle:
+                try:
+                    size = ctypes.c_uint(260)
+                    buf = ctypes.create_unicode_buffer(260)
+                    if kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+                        name = buf.value
+                finally:
+                    kernel32.CloseHandle(handle)
+            cache[pid.value] = (name, now)
+            self._overlay_process_cache = cache
+            return name
+        except Exception:
+            return ""
+
+    def _window_above_pet(self, root) -> bool:
+        """按顶层窗口 Z 序判断 root 是否真的盖在桌宠上面。
+
+        不能按“WindowFromPoint 不是桌宠”判断：桌宠是色键透明窗口，系统经常把
+        颜色像素下的窗口答成 owner；只有 Z 序在桌宠之前，才是真正的覆盖层。
+        """
+        try:
+            pet = int(self._hwnd_int or 0)
+            target = self._hwnd_value(root)
+            if not pet or not target or target == pet:
+                return False
+            # 从桌面最上方开始遍历真正的顶层 Z 序，不依赖 GetWindow(GW_HWNDFIRST)
+            # 对 popup/owned window 的解释；快速设置这类 Shell popup 也能正确比较。
+            current = self._hwnd_value(user32.GetTopWindow(None))
+            seen = 0
+            while current and seen < 1024:
+                if current == target:
+                    return True
+                if current == pet:
+                    return False
+                current = self._hwnd_value(user32.GetWindow(wt.HWND(current), GW_HWNDNEXT))
+                seen += 1
+        except Exception:
+            pass
+        return False
+
+    def point_on_shell_overlay(self, xy) -> bool:
+        """光标是不是落在任务栏、开始菜单、快速设置/控制中心等覆盖层上。
+
+        先认已知 Shell 窗口类；再按顶层 Z 序兜底。这样 Win11 不同 Build 的
+        快速设置窗口类名变化也能拦截，同时不会误伤色键透明桌宠下面的普通窗口。
         """
         if not xy:
             return False
@@ -1566,7 +1727,14 @@ class PetHost:
             root = user32.GetAncestor(wt.HWND(owner), GA_ROOT) or owner
             buf = ctypes.create_unicode_buffer(128)
             user32.GetClassNameW(wt.HWND(root), buf, 128)
-            return buf.value in SHELL_OVERLAY_CLASSES
+            class_name = buf.value
+            if class_name in SHELL_OVERLAY_CLASSES:
+                return True
+            if self._is_shell_overlay_process_name(self._window_process_name(root)):
+                return True
+            # 快速设置在部分 Build 上是普通顶层窗口，但 Z 序确实高于桌宠；
+            # 这条兜底也能处理类名和进程名都变化的情况。
+            return self._window_above_pet(root)
         except Exception:
             return False
 
@@ -2131,9 +2299,13 @@ class PetHost:
         只刷新数据，不重新载入模型（那是“重新载入形象”的事）。
         """
         try:
-            import codex_state
+            import agent_state
 
-            payload = codex_state.snapshot()
+            # 卡片刷新必须读取设置里选中的 agent。以前这里硬编码 Codex，
+            # 所以切到 Claude/Gemini 等 agent 后点刷新会先闪一下 Codex 信息，
+            # 等下一秒的 state_loop 才换成正确 agent。
+            agent_id = str((self.settings or {}).get("agent") or "codex")
+            payload = agent_state.snapshot(agent_id)
             payload["usage"] = usage_line(self)
             self.last_payload = payload
             if not self.inline_card_open:
@@ -2456,10 +2628,27 @@ class PetHost:
                     menu.Items.Add(ToolStripSeparator())
                     continue
                 item = ToolStripMenuItem(label)
-                item.Click += (lambda sender, args, h=handler: h())
+
+                def on_item_click(sender, args, h=handler):
+                    # 记下"是点菜单项关的"：诊断菜单生命周期用
+                    self._menu_close_reason = "点选了菜单项"
+                    h()
+
+                item.Click += on_item_click
                 menu.Items.Add(item)
             menu.Closed += self.on_menu_closed
             self.menu = menu
+        if self.menu.Visible:
+            # 菜单还开着又收到"弹出"请求（右键连点、或状态不同步）：在一个正显示着的
+            # 弹出菜单上再次 Show，会把它弄成"画着但悬停不亮、要先去别处点一下才恢复"
+            # 的幽灵状态（2026-10-12 用户报告的 bug）。先收掉，下一次 tick 再弹干净的。
+            try:
+                self.menu.Close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._pending_menu_at = (screen_x, screen_y)
+            log("菜单还开着，先收掉再重弹")
+            return
         try:
             # 菜单文字跟着当前选中的 agent 走：切到 Hermes CLI 窗口 / 切到 Codex 窗口 …
             label = "切到 %s 窗口" % self.agent_display_name()
@@ -2473,6 +2662,7 @@ class PetHost:
         self._menu_shown_at = time.time()
         self._menu_close_at = 0.0        # 新菜单：把上一次遗留的关闭请求作废
         self._menu_visible = True
+        self._menu_ghost_since = None
         self._menu_rect = self.menu_screen_rect()
         if self._menu_rect:
             # 记下菜单真正落下的位置：点里面的「切换卡片 Agent」时，面板要顶在同一个地方
@@ -2485,14 +2675,16 @@ class PetHost:
         self._menu_visible = False
         self._menu_rect = None
         self._menu_close_at = 0.0
+        self._menu_ghost_since = None
         # 关键：点菜单项会让菜单**立刻**关闭，等 33ms 后轮询再跑时菜单已经不可见了 ——
         # 只靠 _menu_visible 挡不住，所以关菜单时统一开一小段忽略窗口，
         # 把"点菜单的那一下"整段吃掉（含按下、松开），不让它落到下面的图标按钮上。
         self._ignore_click_until = time.time() + 0.35
         alive = time.time() - self._menu_shown_at if self._menu_shown_at else 0.0
-        if 0 < alive < 0.6:
-            # 刚弹出就被关掉：多半是"上一次的关闭请求"或者点外面漏进来了，记一笔方便排查
-            log("右键菜单刚弹出就关闭了（存活 %.2fs）" % alive)
+        reason = self._menu_close_reason or "外部点击 / 系统关闭"
+        self._menu_close_reason = ""
+        # 每次关闭都记一笔（含原因和存活时长）：排查"悬停不亮"这类生命周期问题用
+        log("右键菜单已关闭（%s，存活 %.2fs%s）" % (reason, alive, "，很快就关了" if 0 < alive < 0.6 else ""))
 
     def menu_screen_rect(self):
         """菜单当前的屏幕矩形（菜单是顶层弹出窗口，Bounds 就是屏幕坐标）。"""
