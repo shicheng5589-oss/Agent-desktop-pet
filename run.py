@@ -354,6 +354,31 @@ def save_position(x: int, y: int) -> None:
         pass
 
 
+def clamp_rect_to_area(x: int, y: int, w: int, h: int, area, char_rect, max_out: float = 0.5):
+    """把窗口左上角夹住：允许角色最多 max_out（默认一半）伸出屏幕任一边。
+
+    char_rect=(cx, cy, cw, ch) 是角色相对窗口左上角的包围盒（物理像素）。
+    不管怎么拖，角色至少有 (1-max_out) 留在屏幕可用区域内 ——
+    半个身子探出屏幕可以，但留下的那半必须还能点到、拖得回来。
+    """
+    left, top, right, bottom = area
+    x, y, w, h = int(x), int(y), int(w), int(h)
+    cx, cy, cw, ch = (int(round(float(v))) for v in char_rect)
+    cw = max(2, cw)
+    ch = max(2, ch)
+    keep = max(0.0, min(1.0, 1.0 - float(max_out)))
+    # ceil/floor 保证取整之后留下的可见部分仍然 ≥ keep
+    min_x = int(math.ceil(left - max_out * cw - cx))
+    max_x = int(math.floor(right - keep * cw - cx))
+    min_y = int(math.ceil(top - max_out * ch - cy))
+    max_y = int(math.floor(bottom - keep * ch - cy))
+    if max_x < min_x:
+        min_x = max_x = int(round(left - cx))
+    if max_y < min_y:
+        min_y = max_y = int(round(top - cy))
+    return int(min(max(x, min_x), max_x)), int(min(max(y, min_y), max_y))
+
+
 def load_settings_window_rect():
     """设置窗口上次摆好的矩形 (x, y, 宽, 高)；没存过或者存坏了返回 None。"""
     try:
@@ -969,9 +994,14 @@ class PetHost:
         form.Opacity = float(self.settings.get("opacity", 1.0))
         saved = load_saved_position()
         if saved:
-            virtual = Screen.GetWorkingArea(form)
-            if virtual.Left - 40 <= saved[0] <= virtual.Right - 40 and virtual.Top <= saved[1] <= virtual.Bottom - 40:
-                form.Location = Point(saved[0], saved[1])
+            # 旧版本允许把桌宠拖到屏幕外（角落只露出一小块），还会把坐标存下来；
+            # 这里夹回离它最近的屏幕：允许半个身子出屏，但至少留一半可点，并写回结果。
+            fixed = self.clamp_pet_position(saved[0], saved[1], physical_w, physical_h)
+            form.Location = Point(fixed[0], fixed[1])
+            if tuple(fixed) != tuple(saved):
+                save_position(fixed[0], fixed[1])
+                log("窗口位置越界，已夹回（至少留半个身子在屏幕内）：%s → %s" % (tuple(saved), fixed))
+            else:
                 log("窗口位置已恢复：%s" % (saved,))
         log("窗口 %dx%d（DPI %d，桌宠缩放 %.2f）" % (physical_w, physical_h, dpi, self.pet_scale))
         self.form = form
@@ -2121,6 +2151,59 @@ class PetHost:
         except Exception:
             pass
 
+    def character_footprint(self, w=None, h=None):
+        """角色相对窗口左上角的近似包围盒（物理像素），用来算"半个身子"。
+
+        模型在网页里是水平居中、贴着底部摆放的：水平用整个窗口宽 ——
+        允许窗口一半出屏，正好等于角色一半出屏。垂直优先用网页上报的
+        模型高度（每 220ms 更新，卡片开合/缩放会自动变化），网页还没就绪时
+        用 CHAR_BASE_H 估算，保证启动时也能夹取。
+        """
+        if w is None or h is None:
+            w = self.form.ClientSize.Width
+            h = self.form.ClientSize.Height
+        w, h = max(2, int(w)), max(2, int(h))
+        char_h = None
+        try:
+            cr = getattr(self, "char_rect", None)
+            if cr and len(cr) >= 4 and float(cr[3]) >= 4:
+                char_h = int(round(float(cr[3])))
+        except Exception:  # noqa: BLE001
+            pass
+        if not char_h:
+            char_h = int(round(CHAR_BASE_H * (self.dpi_scale or 1.0) * (self.pet_scale or 1.0)))
+        char_h = max(2, min(char_h, h))
+        return (0, h - char_h, w, char_h)
+
+    def clamp_pet_position(self, x, y, w=None, h=None, anchor_point=None, max_out=0.5):
+        """把桌宠窗口左上角夹住：允许角色最多 max_out（默认一半）伸出屏幕，
+
+        但至少留一半在屏幕可用区域内，保证还能点到、拖得回来。
+        anchor_point 用哪个点选显示器：拖动时传光标位置（跟手、跨屏自然）；
+        其它情况用窗口中心 —— 越界时 Screen.FromPoint 会返回离它最近的屏幕。
+        """
+        from System.Windows.Forms import Screen
+
+        try:
+            if w is None or h is None:
+                w = self.form.ClientSize.Width
+                h = self.form.ClientSize.Height
+            w, h = int(w), int(h)
+            if anchor_point is None:
+                anchor_point = (x + w / 2.0, y + h / 2.0)
+            screen = Screen.FromPoint(self.Point(int(anchor_point[0]), int(anchor_point[1])))
+            area = screen.WorkingArea
+            return clamp_rect_to_area(
+                x, y, w, h,
+                (area.Left, area.Top, area.Right, area.Bottom),
+                self.character_footprint(w, h),
+                max_out=max_out,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log("位置夹取失败（保持原位）：%r" % (exc,))
+            return int(x), int(y)
+
+
     def start_drag_loop(self) -> None:
         """拖动窗口：用一个 15ms 的 UI 定时器按光标位移搬运窗口。
 
@@ -2173,7 +2256,12 @@ class PetHost:
         user32.GetCursorPos(ctypes.byref(cursor))
         ax, ay, win_x, win_y = anchor
         try:
-            self.form.Location = self.Point(int(win_x + cursor.x - ax), int(win_y + cursor.y - ay))
+            nx = int(win_x + cursor.x - ax)
+            ny = int(win_y + cursor.y - ay)
+            # 夹在光标所在的显示器里：允许最多半个身子拖出屏幕，
+            # 但至少留一半在屏幕内，保证还能点到、拖得回来。
+            nx, ny = self.clamp_pet_position(nx, ny, anchor_point=(cursor.x, cursor.y))
+            self.form.Location = self.Point(nx, ny)
             self.refresh_rect_cache()   # 拖完立刻按下时，钩子不能拿旧窗口矩形误判
             self.drag_moves += 1
         except Exception as exc:  # noqa: BLE001
@@ -2750,6 +2838,12 @@ class PetHost:
             self.form.Location = self.Point(right - new_w, bottom - new_h)
         else:
             self.form.Location = self.Point(int(center_x - new_w / 2.0), int(center_y - new_h / 2.0))
+        # 贴着屏幕边缘放大/缩小时也夹一下：仍允许半个身子出屏，但至少留一半可点
+        nx, ny = self.clamp_pet_position(self.form.Left, self.form.Top, new_w, new_h)
+        if (nx, ny) != (self.form.Left, self.form.Top):
+            self.form.Location = self.Point(nx, ny)
+            log("缩放后位置越界，已夹回屏幕内：%s" % ((nx, ny),))
+        save_position(nx, ny)       # 尺寸变化可能改了位置：记住夹取后的结果
         log("窗口调整为 %dx%d" % (new_w, new_h))
         after = (self.form.Left, self.form.Top, self.form.ClientSize.Width, self.form.ClientSize.Height)
         self.schedule_repair_repaint(before, after)
@@ -3132,6 +3226,11 @@ class PetHost:
     def show_from_tray(self) -> None:
         if self.tray_icon is not None:
             self.tray_icon.Visible = False
+        # 恢复前也夹一下：换过显示器 / 分辨率后，别让桌宠出现在屏幕外
+        nx, ny = self.clamp_pet_position(self.form.Left, self.form.Top)
+        if (nx, ny) != (self.form.Left, self.form.Top):
+            self.form.Location = self.Point(nx, ny)
+            save_position(nx, ny)
         self.form.Show()
         self.form.Activate()
         log("桌宠已从系统托盘恢复")
